@@ -32,3 +32,13 @@ dist/
 build/
 .codex/
 .agents/
+# Local session reports and downloaded API schemas.
+/*_AUDIT.md
+/*_REPORT.md
+/*_REVIEW.md
+/DIRECT_TRADING_PLAN.md
+/IMPLEMENTATION_PLAN.md
+/IMPLEMENTATION_STATUS.md
+/POOL_PRICING_RESEARCH.md
+/MATCHA_COMPARISON.md
+/openapi.json

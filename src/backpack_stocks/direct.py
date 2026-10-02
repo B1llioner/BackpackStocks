@@ -113,7 +113,12 @@ class DirectRaydium:
         self.settings, self.rpc = settings, rpc
         self.worker = ClmmWorker(settings.direct.clmm_worker)
         self.calculator = PoolCalculator()
-        catalog = json.loads(Path(settings.direct.catalog).read_text())
+        catalog_path = Path(settings.direct.catalog)
+        if not catalog_path.exists() and settings.direct.catalog == "research/pool-pricing/catalog-native.json":
+            # Clean installs use public pool addresses, never historical prices.
+            # Every bank, reserve and mint is still validated on-chain below.
+            catalog_path = Path(__file__).with_name("direct_pool_catalog.json")
+        catalog = json.loads(catalog_path.read_text())
         self.assets = {a["mint"]: a for a in catalog["assets"]}
         self.by_symbol = {a["symbol"]: a for a in self.assets.values()}
         self.candidates: dict[str, list[str]] = {}
