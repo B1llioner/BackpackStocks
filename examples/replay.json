@@ -1,0 +1,7 @@
+{
+  "description": "Synthetic profitable route, not a historical arbitrage claim. Prices change during delivery.",
+  "frames": [
+    {"offset_s": 0, "ask": "6.00", "bid": "5.98", "dex_bid": "6.30"},
+    {"offset_s": 6, "ask": "6.02", "bid": "6.00", "dex_bid": "6.25"}
+  ]
+}

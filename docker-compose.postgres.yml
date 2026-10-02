@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: backpack-stocks-postgres
+    restart: unless-stopped
+    env_file: .env.postgres
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - ./state/postgres/data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/001-runtime-role.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backpack_migrator -d backpack_stocks"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    shm_size: 128mb
+    mem_limit: 768m

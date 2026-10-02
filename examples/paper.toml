@@ -1,0 +1,24 @@
+mode = "paper"
+source = "replay"
+database = "state/paper-loop.sqlite3"
+rebalance = "each_cycle"
+replay_file = "examples/replay.json"
+poll_s = 1
+paper_delivery_s = 5
+paper_initial_usdc = "1000"
+paper_impact_bps_per_stock = "0.1"
+
+[policy]
+quantity = "10"
+max_cost_usdc = "100"
+min_profit_usdc = "0.20"
+min_edge_bps = 30
+slippage_bps = 50
+backpack_fee_bps = 0
+withdrawal_fee = "0.08"
+withdrawal_min = "0.16"
+# Assumption for paper. Real mode requires verifying gross/net semantics with actual receipts.
+withdrawal_semantics = "deduct"
+gas_budget_usdc = "0.03"
+max_cycles = 1
+cooldown_s = 0

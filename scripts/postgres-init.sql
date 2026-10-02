@@ -1,0 +1,3 @@
+\getenv app_password BACKPACK_POSTGRES_APP_PASSWORD
+CREATE ROLE backpack_catalog LOGIN PASSWORD :'app_password';
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;

@@ -1,0 +1,43 @@
+mode = "paper"
+source = "public"
+dex_backend = "raydium"
+rebalance = "each_cycle"
+database = "state/telegram-direct-paper.sqlite3"
+backpack_private_reads = true
+paper_auto_start = true
+telegram_digest_s = 120
+poll_s = 3
+paper_delivery_s = 120
+paper_initial_usdc = "1000"
+paper_impact_bps_per_stock = "0.1"
+paper_rest_fallback = true
+paper_rfq_markup_bps = 20
+
+[direct]
+max_pools = 2
+max_tick_arrays = 8
+concurrency = 2
+
+[policy]
+quantity = "10"
+max_cost_usdc = "100"
+min_profit_usdc = "0.50"
+min_edge_bps = 50
+slippage_bps = 50
+backpack_fee_bps = 0
+withdrawal_fee = "0.08"
+withdrawal_min = "0.16"
+withdrawal_semantics = "deduct"
+gas_budget_usdc = "0.03"
+max_cycles = 10
+cooldown_s = 60
+
+[monitor]
+enabled = true
+notional_usdc = "100"
+metadata_s = 300
+price_batch_s = 10
+quote_refresh_s = 10
+max_quote_age_s = 15
+exploration_s = 120
+concurrency = 2

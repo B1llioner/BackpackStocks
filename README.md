@@ -1,0 +1,39 @@
+# BackpackStocks
+
+Монитор акций Backpack RFQ и Jupiter на объём до 1000 USDC, Telegram-бот, отдельные CLI для котировок и сделок. HTTP Jupiter работает через `curl_cffi` с Chrome TLS/HTTP2 и прокси; точные пакетные расчёты цен и пулов ускорены Rust/PyO3. Основной процесс и Telegram работают на Python 3.12+.
+
+## Быстрая установка
+
+Полная настройка, `.env`, команды и диагностика: **[SETUP.md](SETUP.md)**.
+
+```bash
+git clone https://github.com/B1llioner/BackpackStocks.git
+cd BackpackStocks
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e '.[jupiter,dev]'
+npm --prefix local_clmm ci --ignore-scripts --no-audit --no-fund
+cp .env.example .env
+# Заполнить .env по SETUP.md: Telegram, Backpack API signing seed, прокси.
+.venv/bin/python scripts/setup_jupiter.py --env-file .env
+.venv/bin/python scripts/restart_direct_paper.py --config examples/telegram-direct-paper-1k.toml
+```
+
+Сначала откройте чат своего Telegram-бота и отправьте `/start`. `/prices` показывает все акции в нескольких сообщениях: цену Backpack RFQ, цену продажи Jupiter, фактический объём до 1000 USDC, минимальный выход, наличие RFQ и время обеих котировок по Москве. `/prices WEN` показывает одну акцию. `/spreads` показывает только положительный результат после расходов; `/spread PTN` также ставит выбранную акцию в приоритетную очередь.
+
+Цены и прибыльность считаются отдельно: отсутствие положительного спреда не означает отсутствие котировок. Доступность RFQ кешируется на 60 секунд, для спреда используется только актуальная цена RFQ и DEX (15 секунд в профиле 1k). Старые цены в `/prices` отмечены как устаревшие и не участвуют в спреде. Запросы DEX идут по очереди с общим бюджетом провайдера; интервал 10 секунд в конфиге — минимальная цель повторения одной цены. При большом списке акций полный обход дольше, фактический медианный период показывается в `/prices`.
+
+По умолчанию запускается **paper**. Монитор создаёт и отменяет неисполняемые `AwaitAccept` RFQ для проверки наличия цены. Доступная RFQ означает наблюдавшуюся котировку на указанную сторону/количество, а не гарантированное исполнение новой заявки. Live-покупки и обмены выполняются отдельными CLI с явными флагами и лимитами.
+
+В Git не включаются `.env`, ключи, базы аккаунта, журналы, браузерные записи и рабочие исследования. `.env.example` содержит только пустые поля и учебные значения. Для Rust: `.venv/bin/python -m pip install maturin` и `.venv/bin/maturin develop --release --manifest-path rust/pool-math/Cargo.toml --features python,pyo3/extension-module` при активированной `.venv` и установленном Rust.
+
+## Проверки
+
+```bash
+.venv/bin/pytest -q
+.venv/bin/ruff check src tests scripts
+.venv/bin/mypy src/backpack_stocks
+cargo test --manifest-path rust/pool-math/Cargo.toml
+```
+
+Публичные RPC/DEX-фикстуры находятся в `tests/fixtures`, поэтому основные тесты работают из чистого клона. PostgreSQL-проверки требуют отдельного opt-in и собственного каталога данных. Конфигурации paper и live-шаблоны лежат в `examples`; live требует собственной настройки лимитов, адресов и ключей.

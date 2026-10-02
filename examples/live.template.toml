@@ -1,0 +1,29 @@
+# Fill with verified account-specific values. This template intentionally fails live validation.
+mode = "live"
+source = "public"
+database = "state/live-pilot.sqlite3"
+wallet = "REPLACE_WITH_SOLANA_PUBLIC_KEY"
+enable_live = false
+live_pilot = true
+rebalance = "each_cycle"
+poll_s = 3
+rpc_url = "https://api.mainnet-beta.solana.com"
+
+[policy]
+quantity = "1"
+max_cost_usdc = "10"
+min_profit_usdc = "0.20"
+min_edge_bps = 50
+slippage_bps = 50
+backpack_fee_bps = 0
+withdrawal_fee = "0.08"
+withdrawal_min = "0.16"
+withdrawal_semantics = "unverified"
+gas_budget_usdc = "0.03"
+max_network_lamports = 300000
+min_wallet_lamports = 20000000
+max_cycles = 1
+live_fee_verified = false
+live_quantity_mapping_verified = false
+live_rfq_verified = false
+live_withdrawal_verified = false

@@ -1,0 +1,35 @@
+mode = "paper"
+source = "public"
+rebalance = "each_cycle"
+database = "state/telegram-paper.sqlite3"
+jupiter_interval_s = 1.05
+poll_s = 3
+paper_delivery_s = 120
+paper_initial_usdc = "1000"
+paper_impact_bps_per_stock = "0.1"
+paper_rest_fallback = true
+paper_rfq_markup_bps = 20
+
+[policy]
+quantity = "10"
+max_cost_usdc = "100"
+min_profit_usdc = "0.50"
+min_edge_bps = 50
+slippage_bps = 50
+backpack_fee_bps = 0
+withdrawal_fee = "0.08"
+withdrawal_min = "0.16"
+withdrawal_semantics = "deduct"
+gas_budget_usdc = "0.03"
+max_cycles = 10
+cooldown_s = 60
+
+[monitor]
+enabled = true
+notional_usdc = "100"
+metadata_s = 300
+price_batch_s = 10
+quote_refresh_s = 3
+max_quote_age_s = 8
+exploration_s = 120
+concurrency = 2

@@ -1,0 +1,14 @@
+{
+  "name": "backpack-local-clmm",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local Raydium CLMM math worker; no HTTP, wallet or signing",
+  "dependencies": {
+    "@raydium-io/raydium-sdk-v2": "0.2.73-alpha",
+    "@solana/web3.js": "1.98.4",
+    "bn.js": "5.2.2"
+  },
+  "overrides": {
+    "rpc-websockets": "9.1.3"
+  }
+}

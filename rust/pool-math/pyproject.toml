@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "backpack-pool-math"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.maturin]
+features = ["python", "pyo3/extension-module"]
+module-name = "_pool_math"
+
