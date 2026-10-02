@@ -140,13 +140,14 @@ class SolanaRPC:
             "usdc": tokens[1]["amount"],
         }
 
-    async def transaction(self, signature: str) -> dict | None:
+    async def transaction(self, signature: str, *, priority: int = 0) -> dict | None:
         return await self.call(
             "getTransaction",
             [
                 signature,
-                {"encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 0},
+                {"encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 1},
             ],
+            priority=priority,
         )
 
     async def simulate(self, transaction: str, addresses: list[str], min_slot: int) -> dict:

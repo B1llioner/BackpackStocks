@@ -19,10 +19,11 @@ from .jupiter_flow_quotes import JupiterFlowQuotes
 from .models import STOCK_MINT, USDC_MINT, Observation, Settings, dec, floor_step, impact_percent, raw, ui
 from .observability import MARKET_BLOCKS, QuoteUnavailable, error_code, event
 from .proxy import resolve_proxy
-from .rfq_validation import RfqCheck, RfqUnavailable, RfqValidator
+from .rfq_validation import SIZE_REFUSALS, RfqCheck, RfqUnavailable, RfqValidator
 from .sessions import active_session
 from .solana import SolanaRPC, assert_stock_mint
 from .stock_money import StockValueCalculator
+from .volume_search import VolumeSearch
 
 if TYPE_CHECKING:
     from .direct import DirectRaydium
@@ -203,6 +204,9 @@ class SpreadMonitor:
         self.stock_values = StockValueCalculator()
         self.retry_after: dict[tuple[str, str], float] = {}
         self.quote_failures: Counter[tuple[str, str]] = Counter()
+        self.volume_search = VolumeSearch()
+        self.optimization_requested: set[tuple[str, str]] = set()
+        self.quote_observer: Callable[[dict], None] | None = None
         config = settings.monitor
         self.rfq = RfqValidator(
             backpack,
@@ -235,6 +239,8 @@ class SpreadMonitor:
                 self.rfq.invalidate(symbol)
                 for direction in (FORWARD, REVERSE):
                     self.price_history.pop((symbol, direction), None)
+                    self.volume_search.samples.pop((symbol, direction), None)
+                    self.volume_search.turns.pop((symbol, direction), None)
         chain = {}
         entries = list(found.values())
         for start in range(0, len(entries), 100):
@@ -413,9 +419,10 @@ class SpreadMonitor:
                 session = self.quantity_session(observation)
             except (ValueError, KeyError, TypeError):
                 continue
-            if config.rfq_validation and self.rfq.blocked(asset.symbol, session):
+            size_probe = (asset.symbol, FORWARD) in self.optimization_requested and self.size_refusal(asset)
+            if config.rfq_validation and self.rfq.blocked(asset.symbol, session) and not size_probe:
                 continue
-            if config.rfq_validation and not self.rfq_ready(asset, session):
+            if config.rfq_validation and not self.rfq_ready(asset, session) and not size_probe:
                 continue
             for direction in (FORWARD, REVERSE):
                 key = (asset.symbol, direction)
@@ -446,7 +453,9 @@ class SpreadMonitor:
                         self.failures[key] = "rfq_session_unavailable"
                         self.failure_causes[key] = [self.failures[key]]
                         continue
-                if now < self.retry_after.get(key, 0) or now - last < config.quote_refresh_s:
+                if now < self.retry_after.get(key, 0) or (
+                    key not in self.requested and now - last < config.quote_refresh_s
+                ):
                     continue
                 # Three hot slots followed by one oldest slot: no quote starvation.
                 estimate = self.estimate(asset, direction)
@@ -458,7 +467,7 @@ class SpreadMonitor:
                     and now - previous["observed_at"] <= config.exploration_s
                     and previous.get("screen_spread_at_quote") is not None
                 ):
-                    # Ranking only: learn the measured 1k depth/fees from the last
+                    # Ranking only: learn depth/fees at the last checked size.
                     # calculation. Cold slots still probe every direction; old math
                     # never becomes a fresh candidate or an execution price.
                     hot = dec(previous["edge_bps"]) + estimate - dec(previous["screen_spread_at_quote"])
@@ -472,14 +481,26 @@ class SpreadMonitor:
             return selected[2], selected[3]
         self._sequence += 1
         overdue = [row for row in available if now - row[0] >= config.exploration_s]
-        if self._sequence % 4 == 0:
+        unseen_forward = [row for row in available if row[0] == 0 and row[3] == FORWARD]
+        fresh_positive = any(
+            row.get("profit_raw", 0) > 0 and 0 <= now - row["dex_observed_at"] <= config.max_quote_age_s
+            for row in self.results.values()
+        )
+        hot_available = [row for row in available if row[1] < 0]
+        if unseen_forward and not fresh_positive:
+            # Finish the first buy/sell price pass before repeatedly probing a
+            # few misleading point-price leaders or unfunded reverse legs.
+            selected = min(unseen_forward, key=lambda row: (row[1], row[2]))
+        elif self._sequence % 4 == 0 or not hot_available:
             selected = min(overdue or available)
         else:
-            selected = min(available, key=lambda row: (row[1], row[0], row[2], row[3]))
+            selected = min(hot_available, key=lambda row: (row[1], row[0], row[2], row[3]))
         return selected[2], selected[3]
 
-    async def validated_buy(self, asset: Asset, obs: Observation) -> tuple[int, int, Observation, RfqCheck]:
-        acquired, delivered = self.sizing(asset, obs)
+    async def validated_buy(
+        self, asset: Asset, obs: Observation, *, notional: Decimal | None = None
+    ) -> tuple[int, int, Observation, RfqCheck]:
+        acquired, delivered = self.sizing(asset, obs, notional=notional)
         session = self.quantity_session(obs)
         # FMV can be below the real ask. Resize down and request that exact size again.
         for _ in range(3):
@@ -494,7 +515,7 @@ class SpreadMonitor:
                     "source": "Backpack AwaitAccept RFQ; cancelled after inspection",
                 }
             )
-            resized, delivered_resized = self.sizing(asset, obs)
+            resized, delivered_resized = self.sizing(asset, obs, notional=notional)
             if resized >= acquired:
                 return acquired, delivered, obs, check
             acquired, delivered = resized, delivered_resized
@@ -515,6 +536,13 @@ class SpreadMonitor:
     def rfq_ready(self, asset: Asset, session: str) -> bool:
         check = self.rfq.latest.get((asset.symbol, "Bid"))
         return bool(check and check.session == session and check.eligible(self.clock()))
+
+    def size_refusal(self, asset: Asset) -> bool:
+        try:
+            check = self.rfq.blocked(asset.symbol, self.quantity_session(self.observation(asset)))
+        except (ValueError, KeyError, TypeError):
+            return False
+        return bool(check and check.reason in SIZE_REFUSALS)
 
     async def refresh_rfq_asset(self, asset: Asset) -> None:
         try:
@@ -566,8 +594,12 @@ class SpreadMonitor:
             await asyncio.gather(*pending.values(), return_exceptions=True)
 
     async def quote(
-        self, key: tuple[str, str], *, quote_pair: Callable[..., Awaitable[dict]] | None = None
-    ) -> None:
+        self,
+        key: tuple[str, str],
+        *,
+        quote_pair: Callable[..., Awaitable[dict]] | None = None,
+        notional: Decimal | None = None,
+    ) -> dict | None:
         symbol, direction = key
         started = self.clock()
         self.attempted[key] = started
@@ -576,23 +608,30 @@ class SpreadMonitor:
             asset = self.assets[symbol]
             obs = self.observation(asset)
             p = self.settings.policy
+            budget = min(dec(self.settings.monitor.notional_usdc), dec(p.max_cost_usdc))
+            if notional is not None:
+                budget = min(budget, notional)
+            if budget <= 0:
+                raise ValueError("Invalid size budget")
             rfq_check = None
             if self.settings.monitor.rfq_validation and (
                 direction == FORWARD or not self.rfq_ready(asset, self.quantity_session(obs))
             ):
-                buy_acquired, buy_delivered, obs, rfq_check = await self.validated_buy(asset, obs)
+                buy_acquired, buy_delivered, obs, rfq_check = await self.validated_buy(
+                    asset, obs, notional=budget
+                )
             if direction == FORWARD:
                 acquired, delivered = (
                     (buy_acquired, buy_delivered)
                     if self.settings.monitor.rfq_validation
-                    else self.sizing(asset, obs)
+                    else self.sizing(asset, obs, notional=budget)
                 )
                 source, target, input_raw = asset.mint, USDC_MINT, delivered
             else:
                 if not asset.deposit_enabled or self.chain.get(symbol) != "verified_unit_mapping":
                     raise ValueError("Reverse deposit/mint mapping unavailable")
                 source, target = USDC_MINT, asset.mint
-                input_raw = raw(min(dec(self.settings.monitor.notional_usdc), dec(p.max_cost_usdc)))
+                input_raw = raw(budget)
                 acquired = delivered = 0
                 previous = self.rfq.latest.get((symbol, "Ask"))
                 if (
@@ -611,7 +650,7 @@ class SpreadMonitor:
                 source, target, input_raw, priority=10
             )
             if self.assets.get(symbol) != asset:
-                return  # Issuer/metadata changed during the request.
+                return None  # Issuer/metadata changed during the request.
             if not self.settings.monitor.rfq_validation:
                 obs = self.observation(asset)
             if self.quantity_session(obs) != obs.session and rfq_check:
@@ -647,7 +686,7 @@ class SpreadMonitor:
                 )
             profit = proceeds - cost - gas
             if self.assets.get(symbol) != asset:
-                return
+                return None
             edge = Decimal(profit) * 10000 / cost
             impact = abs(impact_percent(quote))
             self.results[key] = {
@@ -706,10 +745,17 @@ class SpreadMonitor:
                 and quote.get("quote_source") != "jupiter_flow"
                 and self.quote_backend == self.settings.dex_backend,
                 "indicative": True,
+                "search_budget_usdc": str(budget),
+                "size_feasible": cost <= raw(budget)
+                and impact <= dec(p.max_price_impact_pct)
+                and int(quote.get("slippageBps") or 0) <= p.slippage_bps,
                 "screen_spread_at_quote": str(self.estimate(asset, direction))
                 if self.estimate(asset, direction) is not None
                 else None,
             }
+            self.volume_search.record(key, self.results[key])
+            if self.quote_observer:
+                self.quote_observer(self.results[key])
             self.failures.pop(key, None)
             self.failure_causes.pop(key, None)
             pair = price_pair(self.results[key])
@@ -725,7 +771,7 @@ class SpreadMonitor:
                 "quote_complete",
                 asset=symbol,
                 direction=direction,
-                size_usdc=self.settings.monitor.notional_usdc,
+                size_usdc=str(budget),
                 cost_raw=cost,
                 profit_raw=profit,
                 edge_bps=str(edge),
@@ -734,8 +780,24 @@ class SpreadMonitor:
                 dex_price=pair["dex_price"],
                 quoted_output_raw=quoted_output,
                 minimum_output_raw=output,
+                quantity_raw=acquired if direction == FORWARD else sellable,
                 elapsed_s=self.clock() - started,
             )
+            actual = self.results[key]
+            now = self.clock()
+            fresh_samples = [
+                r
+                for r in self.volume_search.samples[key]
+                if r["size_feasible"]
+                and r["mint"] == asset.mint
+                and r["backpack_session"] == actual["backpack_session"]
+                and 0 <= now - r["dex_observed_at"] <= self.settings.monitor.max_quote_age_s
+                and (not r["backpack_quote_confirmed"] or now < r["backpack_rfq_valid_until"])
+            ]
+            if fresh_samples:
+                self.results[key] = max(fresh_samples, key=lambda r: r["profit_raw"])
+                self.price_history[key] = price_pair(self.results[key])
+            return actual
         except asyncio.CancelledError:
             self.results.pop(key, None)
             raise
@@ -765,6 +827,7 @@ class SpreadMonitor:
                 self.retry_after[key] = self.clock() + delay
         finally:
             self.updated.set()
+        return None
 
     async def metadata_loop(self) -> None:
         while True:
@@ -826,7 +889,16 @@ class SpreadMonitor:
                 selected = self.choose()
                 if selected is None:
                     break
-                self.pending[selected] = asyncio.create_task(self.quote(selected))
+                if selected in self.optimization_requested:
+                    self.optimization_requested.discard(selected)
+                    self.pending[selected] = asyncio.create_task(self.optimize(selected))
+                else:
+                    cap = min(
+                        dec(self.settings.monitor.notional_usdc), dec(self.settings.policy.max_cost_usdc)
+                    )
+                    self.pending[selected] = asyncio.create_task(
+                        self.quote(selected, notional=self.volume_search.next(selected, cap, self.clock()))
+                    )
             version = self.backpack.stock_feed.version
             try:
                 await asyncio.wait_for(self.backpack.stock_feed.wait(version), timeout=0.25)
@@ -1227,6 +1299,65 @@ class SpreadMonitor:
         return any(key[0] == symbol for key in self.requested) or any(
             key[0] == symbol for key in self.pending
         )
+
+    def request_optimization(self, symbol: str) -> bool:
+        asset = self.assets.get(symbol)
+        if (
+            asset is None
+            or self.chain.get(symbol) != "verified_unit_mapping"
+            or self.rfq_cooldown(asset, FORWARD)
+            and not self.size_refusal(asset)
+        ):
+            return False
+        key = symbol, FORWARD
+        if key in self.pending:
+            return False
+        self.optimization_requested.add(key)
+        self.requested.setdefault(key, self.clock())
+        return True
+
+    async def optimize(self, key: tuple[str, str]) -> None:
+        """Bounded exact-size search occupying one ordinary scheduler slot."""
+        cap = min(dec(self.settings.monitor.notional_usdc), dec(self.settings.policy.max_cost_usdc))
+        samples: list[dict] = []
+        try:
+            async with asyncio.timeout(35):
+                for fraction in VolumeSearch.fractions:
+                    row = await self.quote(key, notional=cap * fraction)
+                    if row is not None:
+                        samples.append(dict(row))
+                    if self.rfq_cooldown(self.assets[key[0]], key[1]) and not self.size_refusal(
+                        self.assets[key[0]]
+                    ):
+                        break
+                feasible = [r for r in samples if r["size_feasible"]]
+                if samples:
+                    best = (
+                        max(feasible, key=lambda r: r["profit_raw"])
+                        if feasible
+                        else min(samples, key=lambda r: r["cost_raw"])
+                    )
+                    # Refine around the coarse winner, while preserving the hard cap.
+                    for budget in (
+                        max(cap / 32, dec(best["search_budget_usdc"]) - cap / 16),
+                        min(cap, dec(best["search_budget_usdc"]) + cap / 16),
+                    ):
+                        if any(dec(r["search_budget_usdc"]) == budget for r in samples):
+                            continue
+                        row = await self.quote(key, notional=budget)
+                        if row is not None:
+                            samples.append(dict(row))
+                            if row["size_feasible"] and (
+                                not best["size_feasible"] or row["profit_raw"] > best["profit_raw"]
+                            ):
+                                best = row
+                    # A winning old sample is re-quoted before it becomes the current result.
+                    await self.quote(key, notional=dec(best["search_budget_usdc"]))
+        except TimeoutError:
+            event("volume_search_timeout", asset=key[0], direction=key[1])
+        finally:
+            event("volume_search_complete", asset=key[0], direction=key[1], quotes=len(samples))
+            self.updated.set()
 
     async def refresh_report(self, symbol: str | None = None) -> dict:
         """Refresh public inputs and every displayed pair before producing a report."""

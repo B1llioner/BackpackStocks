@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from solders.keypair import Keypair
 
@@ -21,6 +22,7 @@ from .solana import SolanaRPC
 from .store import Store
 from .swap_guard import SwapGuard
 from .transfer import USDCTransfer
+from .wallet_watch import WalletJournal, WalletWatcher
 
 
 def required_env(name: str) -> str:
@@ -59,6 +61,7 @@ async def runtime(settings: Settings):
     clients: list[Backpack | Jupiter | DirectRaydium | SolanaRPC] = []
     market: ReplayMarket | PublicMarket | None = None
     monitor: SpreadMonitor | None = None
+    watcher: WalletWatcher | None = None
     broker: PaperBroker | LiveBroker
     wallet_lease: WalletLease | None = None
     wallet_reserved = False
@@ -112,8 +115,20 @@ async def runtime(settings: Settings):
                 await monitor.start()
         engine = Engine(settings, store, market, broker)
         engine.monitor = monitor
+        if settings.source == "public":
+            watcher = WalletWatcher(
+                WalletJournal(Path(settings.database).parent / "wallet-watch.sqlite3"), rpc, monitor
+            )
+            engine.wallet_watch = watcher
+            if monitor:
+                monitor.quote_observer = watcher.capture_quote
+            watcher.start()
         yield engine
     finally:
+        if monitor:
+            monitor.quote_observer = None
+        if watcher:
+            await watcher.close()
         if monitor:
             await monitor.close()
         if market:

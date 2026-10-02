@@ -272,6 +272,159 @@ def test_missing_batch_price_still_gets_exact_quote_exploration(monitor):
     assert mon.choose() is not None
 
 
+def test_first_forward_pass_is_not_starved_by_repeated_point_price_leader(monitor):
+    mon, clock = monitor
+    mon.assets["COLD.US"] = asset("COLD.US", USDC_MINT, deposit=False)
+    mon.assets["WEN.US"] = replace(mon.assets["WEN.US"], deposit_enabled=False)
+    mon.chain["COLD.US"] = "verified_unit_mapping"
+    mon.backpack.stock_feed.latest["COLD"] = observed(clock)
+    mon.attempted[("WEN.US", FORWARD)] = clock() - 10
+    mon.estimate = lambda a, direction=None: Decimal("1000") if a.symbol == "WEN.US" else None
+    assert mon.choose() == ("COLD.US", FORWARD)
+
+
+def test_without_projected_positive_spread_scheduler_uses_oldest_on_every_slot(monitor):
+    mon, clock = monitor
+    mon.assets["COLD.US"] = asset("COLD.US", USDC_MINT, deposit=False)
+    mon.assets["WEN.US"] = replace(mon.assets["WEN.US"], deposit_enabled=False)
+    mon.chain["COLD.US"] = "verified_unit_mapping"
+    mon.backpack.stock_feed.latest["COLD"] = observed(clock)
+    mon.attempted[("WEN.US", FORWARD)] = clock() - 10
+    mon.attempted[("COLD.US", FORWARD)] = clock() - 50
+    mon.estimate = lambda a, direction=None: Decimal("-10") if a.symbol == "WEN.US" else Decimal("-100")
+    assert mon.choose() == ("COLD.US", FORWARD)
+
+
+async def test_volume_search_finds_positive_smaller_trade_when_full_budget_loses(monitor):
+    mon, _ = monitor
+    mon.settings.policy.min_profit_usdc = "0.1"
+    mon.settings.policy.min_edge_bps = 0
+
+    async def depth_curve(source, target, units, **kwargs):
+        quantity = Decimal(units) / 10**6
+        output = quantity * Decimal("6.3") - quantity**2 * Decimal("0.02")
+        return {"outAmount": str(int(output * 10**6)), "priceImpact": "0.1"}
+
+    mon.jupiter.quote_pair.side_effect = depth_curve
+    key = "WEN.US", FORWARD
+    baseline = await mon.quote(key)
+    assert baseline is not None and baseline["profit_raw"] < 0
+    await mon.optimize(key)
+    row = mon.results[key]
+    assert row["profit_raw"] > 0
+    assert Decimal(row["search_budget_usdc"]) < 100
+    assert row["cost_raw"] <= 100_000_000
+    assert mon.snapshot()["rows"][0]["candidate"]
+    assert len(mon.jupiter.quote_pair.await_args_list) <= 9
+    assert mon.jupiter.quote_pair.await_args_list[-1].args[2] == row["delivered_raw"]
+
+
+async def test_volume_samples_never_resurrect_expired_positive_price(monitor):
+    mon, clock = monitor
+    mon.jupiter.quote_pair.return_value = {"outAmount": "55000000", "priceImpact": "0.1"}
+    key = "WEN.US", FORWARD
+    await mon.quote(key, notional=Decimal(50))
+    assert mon.results[key]["profit_raw"] > 0
+    mon.jupiter.quote_pair.return_value = {"outAmount": "99000000", "priceImpact": "0.1"}
+    actual = await mon.quote(key)
+    assert actual is not None and actual["profit_raw"] < 0
+    assert mon.results[key]["cost_raw"] < 50_000_001
+    clock.now += mon.settings.monitor.max_quote_age_s + 1
+    mon.backpack.stock_feed.latest["WEN"] = observed(clock)
+    await mon.quote(key)
+    assert mon.results[key]["profit_raw"] < 0
+    assert all("profit_raw" not in r for r in mon.snapshot()["rows"])
+
+
+async def test_volume_request_keeps_exact_rfq_budget_after_price_increases(monitor):
+    from backpack_stocks.rfq_validation import RfqCheck
+
+    mon, clock = monitor
+    mon.settings.monitor.rfq_validation = True
+    seen = []
+
+    async def check(symbol, quantity, session):
+        seen.append(Decimal(quantity))
+        return RfqCheck(
+            symbol,
+            "Bid",
+            quantity,
+            session,
+            "available",
+            "quote_observed",
+            clock(),
+            clock() + 8,
+            clock() + 60,
+            "7",
+        )
+
+    mon.rfq.check = AsyncMock(side_effect=check)
+    mon.jupiter.quote_pair.return_value = {"outAmount": "55000000", "priceImpact": "0.1"}
+    row = await mon.quote(("WEN.US", FORWARD), notional=Decimal(50))
+    assert row is not None
+    assert seen[0] > seen[-1]
+    assert row["cost_raw"] <= 50_000_000
+    assert Decimal(row["acquired_raw"]) / 10**6 == seen[-1]
+    assert row["backpack_quote_confirmed"]
+
+
+async def test_volume_search_goes_smaller_when_every_coarse_size_exceeds_impact_limit(monitor):
+    mon, _ = monitor
+
+    async def output(source, target, units, **kwargs):
+        return {"outAmount": str(units * 7), "priceImpact": "2" if units > 1_000_000 else "0.1"}
+
+    mon.jupiter.quote_pair.side_effect = output
+    await mon.optimize(("WEN.US", FORWARD))
+    row = mon.results[("WEN.US", FORWARD)]
+    assert row["size_feasible"] and Decimal(row["search_budget_usdc"]) < Decimal("12.5")
+
+
+async def test_explicit_size_search_retries_smaller_rfq_after_full_size_balance_refusal(monitor):
+    mon, clock = monitor
+    mon.settings.monitor.rfq_validation = True
+    mon.backpack.auth = object()
+    session = "US_EQUITIES_REGULAR"
+    mon.rfq.latest[("WEN.US", "Bid")] = mon.rfq.result(
+        "WEN.US", "Bid", "16.66666", session, "unavailable", "rfq_insufficient_balance"
+    )
+
+    async def inspect(symbol, side, quantity, session):
+        available = Decimal(quantity) <= 8
+        return mon.rfq.result(
+            symbol,
+            side,
+            quantity,
+            session,
+            "available" if available else "unavailable",
+            "rfq_quote_observed" if available else "rfq_insufficient_balance",
+            "6" if available else None,
+        )
+
+    mon.rfq.inspect = AsyncMock(side_effect=inspect)
+    mon.jupiter.quote_pair.side_effect = lambda source, target, units, **kw: {
+        "outAmount": str(units * 7),
+        "priceImpact": "0.1",
+    }
+    assert mon.request_optimization("WEN.US") and mon.choose() == ("WEN.US", FORWARD)
+    await mon.optimize(("WEN.US", FORWARD))
+    row = mon.results[("WEN.US", FORWARD)]
+    assert row["backpack_quote_confirmed"] and row["profit_raw"] > 0
+    assert row["acquired_raw"] <= 8_000_000 and row["cost_raw"] < 50_000_000
+    assert mon.rfq.latest[("WEN.US", "Bid")].usable(clock())
+
+
+def test_explicit_optimization_has_priority_without_bypassing_dex_error_backoff(monitor):
+    mon, clock = monitor
+    key = "WEN.US", FORWARD
+    mon.attempted[key] = clock()
+    assert mon.request_optimization("WEN.US")
+    assert mon.choose() == key
+    mon.retry_after[key] = clock() + 60
+    mon.requested[key] = clock()
+    assert mon.choose() != key
+
+
 def test_provider_mid_and_rest_model_are_not_claimed_as_firm_rfq(monitor):
     mon, clock = monitor
     mon.backpack.stock_feed.latest.clear()

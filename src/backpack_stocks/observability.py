@@ -54,6 +54,7 @@ FIELDS = {
     "quoted_output_raw",
     "minimum_output_raw",
     "quantity",
+    "signature",
 }
 REASONS = {
     "Pool swaps disabled": "pool_disabled",

@@ -102,14 +102,17 @@ async def test_no_quote_means_unavailable_until_cooldown_then_rechecked(monkeypa
     monkeypatch.setattr("backpack_stocks.rfq_validation.asyncio.sleep", advance)
     result = await validator.check("PTN.US", "112", "PRE_MARKET")
     assert result.state == "unavailable" and result.reason == "rfq_no_quote"
-    assert await validator.check("PTN.US", "111", "PRE_MARKET") == result
+    assert await validator.check("PTN.US", "112.0", "PRE_MARKET") == result
     bp.submit_rfq.assert_awaited_once()
     assert validator.blocked("PTN.US", "PRE_MARKET") and not validator.blocked("PTN.US", "REGULAR")
+    smaller = await validator.check("PTN.US", "111", "PRE_MARKET")
+    assert smaller.quantity == "111" and smaller.state == "unavailable"
+    assert bp.submit_rfq.await_count == 2
     clock.now += 121
     assert not validator.blocked("PTN.US", "PRE_MARKET")
     await validator.check("PTN.US", "112", "PRE_MARKET")
-    assert bp.submit_rfq.await_count == 2
-    assert bp.cancel_rfq.await_count == 2
+    assert bp.submit_rfq.await_count == 3
+    assert bp.cancel_rfq.await_count == 3
     bp.accept_rfq.assert_not_called()
 
 

@@ -45,6 +45,7 @@ class JupiterFlowQuotes:
             "queued": self.replay.queued,
             "cooldown_s": max(0, self.replay._defer_until - time.monotonic()),
             "wallet_context": self.wallet is not None,
+            "transaction_version": 1,
         }
 
     async def quote_pair(self, source: str, target: str, amount: int, *, priority: int = 0) -> dict:
@@ -59,6 +60,9 @@ class JupiterFlowQuotes:
             profile=self.policy.jupiter_profile,
             wallet=self.wallet,
             slippage_bps=self.slippage,
+            # The user's frontend has V1 enabled. This reader discards unsigned
+            # transaction bytes; supporting V1 quotes does not enable V1 signing.
+            max_transaction_version=1,
         )
         prepared = await self.replay.order(request)
         q = prepared["quote"]

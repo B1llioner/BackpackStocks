@@ -13,6 +13,8 @@ from .models import dec
 from .observability import error_code, event
 from .transport import RemoteError
 
+SIZE_REFUSALS = {"rfq_insufficient_balance", "rfq_invalid_quantity", "rfq_no_quote"}
+
 
 class RfqUnavailable(ValueError):
     def __init__(self, code: str):
@@ -99,7 +101,7 @@ class RfqValidator:
             if cached and cached.checked_at <= self.clock() < cached.retry_at:
                 return cached
             blocked = self.blocked(symbol, session, side)
-            if blocked:
+            if blocked and not (blocked.reason in SIZE_REFUSALS and dec(blocked.quantity) != dec(quantity)):
                 return blocked
             if self.backpack.auth is None:
                 result = self.result(symbol, side, quantity, session, "unknown", "rfq_auth_required")

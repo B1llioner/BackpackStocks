@@ -14,6 +14,7 @@ from .transport import RemoteError, UnknownOutcome
 
 if TYPE_CHECKING:
     from .monitor import SpreadMonitor
+    from .wallet_watch import WalletWatcher
 
 
 class Engine:
@@ -28,6 +29,7 @@ class Engine:
         self.lock = asyncio.Lock()
         self.last_spread: Spread | None = None
         self.monitor: SpreadMonitor | None = None
+        self.wallet_watch: WalletWatcher | None = None
         self.last_scan_quantity_raw = raw(settings.policy.quantity)
 
     def transition(self, c: Cycle, phase: Phase, **updates):

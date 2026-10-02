@@ -87,6 +87,40 @@ async def bot(engine):
         await controller.close()
 
 
+async def test_watch_command_preserves_public_address_and_owner_authorization(bot):
+    controller, server = bot
+    address = "EdsdsfTxpN64YcDBFf3HDwGwoVDfKyMZux38GhXnqTUA"
+    journal = SimpleNamespace(add=Mock())
+    controller.engine.wallet_watch = SimpleNamespace(journal=journal)
+    await controller.handle(update(text="/watch " + address))
+    journal.add.assert_called_once_with(address)
+    assert address in server.replies()[-1]["text"]
+    rejected = update(identity=2, text="/watch " + address)
+    rejected["message"]["from"]["id"] = USER + 1
+    await controller.handle(rejected)
+    assert journal.add.call_count == 1
+
+
+async def test_delivery_callback_waits_for_actual_send_and_reports_outbox_drop(bot):
+    controller, _ = bot
+    controller.queue_replies = True
+    delivered = []
+    await controller.reply("wallet transaction", kind="wallet", on_result=delivered.append)
+    assert delivered == []
+    worker = asyncio.create_task(controller.send_replies())
+    try:
+        await asyncio.wait_for(controller.outbox.join(), 1)
+        assert delivered == [True]
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+    dropped = []
+    for _ in range(controller.outbox.maxsize):
+        await controller.reply("wallet transaction", priority=5, kind="wallet", on_result=dropped.append)
+    await controller.reply("read command", priority=0)
+    assert dropped == [False]
+
+
 @pytest.mark.parametrize(
     "bad",
     [

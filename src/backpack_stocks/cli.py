@@ -106,6 +106,14 @@ def main():
     sub.add_parser("status")
     sub.add_parser("resume")
     sub.add_parser("stop")
+    watch = sub.add_parser(
+        "wallet-watch", help="Register a public Solana address for background transaction tracking"
+    )
+    watch.add_argument("address")
+    optimize = sub.add_parser(
+        "optimize", help="Queue an exact-size search in the running public bot; no trades"
+    )
+    optimize.add_argument("symbol")
     export = sub.add_parser("export-pilot", help="Export live pilot evidence with audit_passed=false")
     export.add_argument("--output", default="state/automation-evidence.json")
     serve = sub.add_parser("serve")
@@ -146,6 +154,28 @@ def main():
         if args.command in {"run", "serve", "telegram"} and settings.mode == "live" and settings.live_pilot:
             raise ValueError("Use the explicit pilot command before enabling automated live execution")
         names: list[str] = []
+        if args.command in {"wallet-watch", "optimize"}:
+            from .wallet_watch import WalletJournal
+
+            journal = WalletJournal(Path(settings.database).parent / "wallet-watch.sqlite3")
+            try:
+                if args.command == "wallet-watch":
+                    journal.add(args.address)
+                    print(json.dumps({"registered": args.address, "poll_s": 20, "execution": False}))
+                else:
+                    journal.request_size_search(args.symbol)
+                    print(
+                        json.dumps(
+                            {
+                                "queued": args.symbol,
+                                "execution": False,
+                                "requires": "running public Telegram/run/serve runtime",
+                            }
+                        )
+                    )
+            finally:
+                journal.close()
+            return
         if args.command in {"stock-quote", "stock-buy"}:
             if not 0 < args.timeout <= 120:
                 raise ValueError("Stock command timeout must be between 0 and 120 seconds")

@@ -27,6 +27,7 @@ async def test_monitor_uses_same_manual_order_as_script_and_cannot_execute(rever
         assert p["clientPlatform"] == "jupiter.web.swap_page" and p["apiKey"] == "fixture-public-key"
         assert p["slippageBps"] == "50" and p["priorityFeeLamports"] == "1000000"
         assert p["swapMode"] == "ExactIn" and p["taker"] == settings.wallet
+        assert p["maxSupportedTransactionVersion"] == "1"
         return httpx.Response(
             200,
             json={

@@ -32,6 +32,9 @@ COMMANDS = [
         ("spread", "Текущий расчёт спреда и расходов"),
         ("spreads", "Топ свежих спредов всех доступных акций"),
         ("prices", "Цены Backpack/Jupiter на 1000 USDC и статус RFQ"),
+        ("optimize", "Подбор объёма по реальным котировкам: /optimize PUSA"),
+        ("wallet", "История отслеживаемого кошелька: /wallet PUSA"),
+        ("watch", "Добавить публичный Solana-адрес: /watch <адрес>"),
         ("universe", "Акции, доступные для вывода в Solana"),
         ("monitor", "Покрытие, возраст котировок и задержки"),
         ("limits", "Лимиты провайдеров, 429 и cooldown"),
@@ -49,6 +52,8 @@ HELP = (
     "/spread — текущий расчёт WEN; /spread FLWS — оба направления выбранной акции\n"
     "/spreads — топ свежих спредов всех акций\n"
     "/prices — цены всех акций, время обновления и RFQ; /prices WEN — одна акция\n"
+    "/optimize PUSA — проверить размеры и повторно запросить лучший\n"
+    "/wallet PUSA — история сделок; /watch <адрес> — отслеживать кошелёк\n"
     "/universe — список акций с выводом в Solana\n"
     "/monitor — состояние монитора и задержки\n"
     "/limits — rate limits, 429 и cooldown\n"
@@ -231,6 +236,7 @@ class TelegramController:
             asyncio.PriorityQueue(maxsize=20)
         )
         self.reply_sequence = itertools.count()
+        self.delivery_callbacks: dict[int, Callable[[bool], None]] = {}
         self.control_lock = asyncio.Lock()
         self.command_tasks: set[asyncio.Task] = set()
         self.account_task: asyncio.Task | None = None
@@ -244,13 +250,18 @@ class TelegramController:
         priority: int = 0,
         kind: str = "command",
         render: Callable[[], str | None] | None = None,
+        on_result: Callable[[bool], None] | None = None,
     ) -> None:
         if not self.queue_replies:
             current = render() if render else text
             if current is not None:
                 await self.api.reply(self.allowed_user_id, current)
+                if on_result:
+                    on_result(True)
             return
         item = (priority, next(self.reply_sequence), text, kind, render)
+        if on_result:
+            self.delivery_callbacks[item[1]] = on_result
         if kind == "digest" or self.outbox.full():
             queued = []
             while not self.outbox.empty():
@@ -258,9 +269,17 @@ class TelegramController:
                 self.outbox.task_done()
                 if kind != "digest" or old[3] != "digest":
                     queued.append(old)
+                else:
+                    callback = self.delivery_callbacks.pop(old[1], None)
+                    if callback:
+                        callback(False)
             queued.append(item)
             if len(queued) > self.outbox.maxsize:
-                queued.remove(max(queued, key=lambda q: (q[0], -q[1])))
+                dropped = max(queued, key=lambda q: (q[0], -q[1]))
+                queued.remove(dropped)
+                callback = self.delivery_callbacks.pop(dropped[1], None)
+                if callback:
+                    callback(False)
                 event("telegram_outbox_drop", level="WARNING", component="telegram")
             for old in queued:
                 self.outbox.put_nowait(old)
@@ -269,13 +288,15 @@ class TelegramController:
 
     async def send_replies(self) -> None:
         while True:
-            _, _, text, _, render = await self.outbox.get()
+            _, sequence, text, _, render = await self.outbox.get()
+            delivered = False
             for attempt in range(3):
                 try:
                     current = render() if render else text
                     if current is None:
                         break  # Expired opportunities must never leave the outbox.
                     await self.api.reply(self.allowed_user_id, current)
+                    delivered = True
                     self.engine.store.event(None, "telegram_reply_sent", {"characters": len(current)})
                     event("telegram_delivered", component="telegram")
                     break
@@ -295,6 +316,9 @@ class TelegramController:
                         event("telegram_delivery_failed", level="ERROR", component="telegram")
                     else:
                         await asyncio.sleep(error.retry_after)
+            callback = self.delivery_callbacks.pop(sequence, None)
+            if callback:
+                callback(delivered)
             self.outbox.task_done()
 
     def alert_text(self, row: dict) -> str:
@@ -455,7 +479,7 @@ class TelegramController:
             text = message.get("text", "")
             parsed = (
                 re.fullmatch(
-                    r"/([a-z_]{1,32})(?:@([A-Za-z0-9_]{5,32}))?(?:[ \t]+([A-Za-z0-9.]{1,32}))?",
+                    r"/([a-z_]{1,32})(?:@([A-Za-z0-9_]{5,32}))?(?:[ \t]+([A-Za-z0-9.]{1,44}))?",
                     text.strip(),
                 )
                 if isinstance(text, str)
@@ -463,11 +487,13 @@ class TelegramController:
             )
             if parsed and parsed[2] and parsed[2].lower() != self.username.lower():
                 return
-            if parsed and parsed[3] and parsed[1] not in {"spread", "prices"}:
+            if parsed and parsed[3] and parsed[1] not in {"spread", "prices", "optimize", "wallet", "watch"}:
                 parsed = None
             command = parsed[1] if parsed else ""
-            symbol = parsed[3].upper() if parsed and parsed[3] else None
-            if symbol and not symbol.endswith(".US"):
+            symbol = parsed[3] if parsed and parsed[3] else None
+            if symbol and command != "watch":
+                symbol = symbol.upper()
+            if symbol and command != "watch" and not symbol.endswith(".US"):
                 symbol += ".US"
         # Consumption is serialized; network work is not. Keep control actions
         # ordered without blocking read commands on a trading step or account API.
@@ -496,6 +522,8 @@ class TelegramController:
                 for index, group in enumerate(groups, 1):
                     render = partial(monitor.prices_text, group, page=index, total=len(groups))
                     await self.reply(render(), render=render)
+                if symbol:
+                    monitor.request_refresh(symbol)
                 return
             text = await self.dispatch(command, symbol)
         except Exception:
@@ -547,7 +575,67 @@ class TelegramController:
         except Exception as error:
             event("monitor_followup_error", level="ERROR", code=type(error).__name__)
 
+    async def deliver_search(self, symbol: str) -> None:
+        monitor = self.engine.monitor
+        assert monitor is not None
+        key = symbol, "backpack_to_jupiter"
+        try:
+            async with asyncio.timeout(45):
+                while (
+                    key in monitor.requested
+                    or key in monitor.pending
+                    or key in monitor.optimization_requested
+                ):
+                    monitor.updated.clear()
+                    try:
+                        await asyncio.wait_for(monitor.updated.wait(), 1)
+                    except TimeoutError:
+                        pass
+            await self.reply(
+                f"Подбор {symbol} завершён.\n"
+                + monitor.text(symbol)
+                + "\n\n"
+                + monitor.prices_text([symbol]),
+                render=lambda: (
+                    f"Подбор {symbol} завершён.\n"
+                    + monitor.text(symbol)
+                    + "\n\n"
+                    + monitor.prices_text([symbol])
+                ),
+            )
+        except TimeoutError:
+            await self.reply(
+                f"{symbol}: подбор ещё в очереди или ограничен API. Результат: /spread {symbol}."
+            )
+
     async def dispatch(self, command: str, symbol: str | None = None) -> str:
+        if command in {"wallet", "watch"}:
+            watcher = self.engine.wallet_watch
+            if watcher is None:
+                return "Отслеживание кошельков доступно с source=public."
+            if command == "watch":
+                if not symbol:
+                    return "/watch <публичный адрес Solana>"
+                try:
+                    watcher.journal.add(symbol)
+                except ValueError:
+                    return "Некорректный адрес Solana или достигнут лимит 4 адресов."
+                return f"Отслеживание включено. Проверка каждые 20с. /wallet\nhttps://solscan.io/account/{symbol}"
+            return watcher.text(symbol)
+        if command == "optimize":
+            monitor = self.engine.monitor
+            selected = symbol or "WEN.US"
+            if monitor is None or selected not in monitor.assets:
+                return "Акция не найдена в мониторе."
+            if not monitor.request_optimization(selected):
+                return f"{selected}: расчёт уже идёт или RFQ сейчас недоступна. /spread {selected}"
+            task = asyncio.create_task(self.deliver_search(selected))
+            self.command_tasks.add(task)
+            task.add_done_callback(self.command_tasks.discard)
+            return (
+                f"{selected}: подбор объёма до {monitor.settings.monitor.notional_usdc} USDC запущен. "
+                f"Проверю несколько размеров и повторно запрошу лучший. Результат: /spread {selected}."
+            )
         if command == "account":
             bp = getattr(self.engine.market, "backpack", None)
             if bp is None or bp.auth is None:
@@ -819,6 +907,8 @@ async def run_telegram(engine: Engine) -> None:
             asyncio.create_task(bot.send_replies()),
             asyncio.create_task(engine_worker(engine)),
         ]
+        if engine.wallet_watch:
+            tasks.append(asyncio.create_task(wallet_notification_worker(bot)))
         if (
             engine.settings.telegram_digest_s
             or engine.settings.telegram_spread_alerts
@@ -832,3 +922,30 @@ async def run_telegram(engine: Engine) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
         await engine.stop()
         await bot.close()
+
+
+async def wallet_notification_worker(bot: TelegramController) -> None:
+    from .wallet_watch import activity_text
+
+    watcher = bot.engine.wallet_watch
+    assert watcher is not None
+    queued: set[tuple[str, str]] = set()
+    while True:
+        for record in watcher.journal.notifications():
+            key = record["wallet"], record["signature"]
+            if key in queued:
+                continue
+            queued.add(key)
+
+            def result(delivered: bool, *, record=record, key=key):
+                queued.discard(key)
+                if delivered:
+                    watcher.journal.ack(record)
+
+            await bot.reply(
+                "КОШЕЛЁК · новая транзакция\n" + activity_text(record),
+                priority=5,
+                kind="wallet",
+                on_result=result,
+            )
+        await asyncio.sleep(5)
