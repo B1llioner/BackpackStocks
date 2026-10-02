@@ -121,7 +121,7 @@ async def test_rfq_precheck_replaces_previous_route_failure_causes(monitor):
     mon.backpack.stock_feed.latest["WEN"].timestamp = clock()
     assert mon.choose() is None
     row = next(r for r in mon.snapshot()["rows"] if r["direction"] == FORWARD)
-    assert row["error_causes"] == ["notional_or_session_or_withdrawal_constraint"]
+    assert row["error_causes"] == ["rfq_session_unavailable"]
 
 
 @pytest.mark.parametrize("bad_accounts", [[], [USDC_MINT], [USDC_MINT, STOCK_MINT]])

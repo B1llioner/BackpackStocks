@@ -195,6 +195,8 @@ class RfqValidator:
             # Transport emits this fixed label, never a remote payload. A refused
             # submission is unavailable for this size/side; an ambiguous mutation
             # or failed query remains unknown and is never repeated in-place.
+            if submitted and error.reason == "rfq_expired":
+                return self.result(symbol, side, quantity, session, "unknown", "rfq_expired_before_check")
             if not submitted and str(error) == "API rejected request: HTTP 400":
                 event(
                     "rfq_rejected",
@@ -212,7 +214,17 @@ class RfqValidator:
                     "market_closed": "rfq_session_unavailable",
                 }.get(error.reason, "rfq_request_rejected")
                 return self.result(symbol, side, quantity, session, "unavailable", reason)
-            event("rfq_error", level="ERROR", asset=symbol, side=side, code=error_code(error))
+            event(
+                "rfq_error",
+                level="ERROR",
+                asset=symbol,
+                side=side,
+                code=error_code(error),
+                status_code=error.status_code,
+                api_code=error.api_code,
+                reason=error.reason,
+                phase="query" if submitted else "submit",
+            )
             return self.result(symbol, side, quantity, session, "unknown", "rfq_check_failed")
         except Exception as error:
             # A transport/auth/schema error is not evidence that the stock cannot be bought.
@@ -225,5 +237,13 @@ class RfqValidator:
                         await self.backpack.cancel_rfq(rfq_id)
                 except Exception as error:
                     event(
-                        "rfq_cancel_failed", level="WARNING", asset=symbol, side=side, code=error_code(error)
+                        "rfq_cancel_expired"
+                        if isinstance(error, RemoteError) and error.reason == "rfq_expired"
+                        else "rfq_cancel_failed",
+                        level="INFO"
+                        if isinstance(error, RemoteError) and error.reason == "rfq_expired"
+                        else "WARNING",
+                        asset=symbol,
+                        side=side,
+                        code=error_code(error),
                     )

@@ -111,6 +111,97 @@ async def test_forward_sizing_uses_fee_adjusted_token_amount_and_net_profit(moni
     assert row["candidate"] and row["indicative"] and row["trading_supported"]
 
 
+async def test_whole_share_probes_raise_fraction_to_legal_floor_without_quote_errors(monitor):
+    mon, clock = monitor
+    mon.assets["WEN.US"] = replace(
+        mon.assets["WEN.US"],
+        sessions=(
+            {"name": "US_EQUITIES_REGULAR", "stepSize": "1", "minQuantity": "1", "maxQuantity": "1000"},
+        ),
+    )
+    mon.backpack.stock_feed.latest["WEN"] = observed(clock, ask="70", bid="69")
+    mon.jupiter.quote_pair.return_value = {"outAmount": "80000000", "priceImpact": "0.1"}
+    row = await mon.quote(("WEN.US", FORWARD), notional=Decimal("12.5"))
+    assert row is not None and row["acquired_raw"] == 1_000_000
+    assert row["cost_raw"] == 70_000_000 and not mon.errors["quote"]
+
+
+async def test_unlimited_background_search_recovers_from_size_specific_balance_refusal(monitor):
+    mon, clock = monitor
+    mon.settings.monitor.auto_size = True
+    mon.settings.monitor.rfq_validation = True
+    mon.backpack.auth = object()
+    mon.assets["WEN.US"] = replace(mon.assets["WEN.US"], deposit_enabled=False)
+
+    async def inspect(symbol, side, quantity, session):
+        if Decimal(quantity) > 10:
+            return mon.rfq.result(symbol, side, quantity, session, "unavailable", "rfq_insufficient_balance")
+        return mon.rfq.result(symbol, side, quantity, session, "available", "rfq_quote_observed", "6")
+
+    async def dex(source, target, units, **kwargs):
+        return {"outAmount": str(units * 7), "priceImpact": "0.1"}
+
+    mon.rfq.inspect = AsyncMock(side_effect=inspect)
+    mon.jupiter.quote_pair.side_effect = dex
+    key = "WEN.US", FORWARD
+    assert await mon.quote(key) is None
+    mon.jupiter.quote_pair.assert_not_awaited()
+    clock.now += 10
+    mon.backpack.stock_feed.latest["WEN"] = observed(clock)
+    assert mon.choose() == key
+    budget = mon.next_budget(key)
+    assert budget <= 50
+    row = await mon.quote(key, notional=budget)
+    assert row and row["backpack_quote_confirmed"] and row["acquired_raw"] <= 10_000_000
+    assert mon.snapshot()["candidates"] == 1
+
+
+@pytest.mark.parametrize(
+    "auto_size,rfq_price", [(True, "1055"), (True, "1155"), (False, "990"), (False, "1055")]
+)
+async def test_minimum_lot_is_checked_against_real_rfq_and_unlimited_monitor_can_alert(
+    monitor, auto_size, rfq_price
+):
+    mon, clock = monitor
+    mon.settings.monitor.auto_size = auto_size
+    mon.settings.monitor.notional_usdc = "1000"
+    mon.settings.policy.max_cost_usdc = "1000"
+    mon.settings.monitor.rfq_validation = True
+    mon.assets["WEN.US"] = replace(
+        mon.assets["WEN.US"],
+        fee=Decimal("0.00005"),
+        sessions=(
+            {"name": "US_EQUITIES_REGULAR", "stepSize": "1", "minQuantity": "1", "maxQuantity": "1000"},
+        ),
+    )
+    mon.backpack.stock_feed.latest["WEN"] = observed(clock, ask="1100", bid="1099")
+
+    async def inspect(symbol, side, quantity, session):
+        return mon.rfq.result(symbol, side, quantity, session, "available", "rfq_quote_observed", rfq_price)
+
+    mon.rfq.inspect = AsyncMock(side_effect=inspect)
+    mon.backpack.auth = object()
+    mon.jupiter.quote_pair.return_value = {
+        "outAmount": str(int((Decimal(rfq_price) + 30) * 10**6)),
+        "priceImpact": "0.1",
+    }
+    await mon.refresh_rfq_asset(mon.assets["WEN.US"])
+    check = mon.rfq.latest[("WEN.US", "Bid")]
+    assert check.quantity == "1" and check.session == "US_EQUITIES_REGULAR"
+    assert check.state == "available"
+    if not auto_size and rfq_price == "1055":
+        assert mon.budget_info("WEN.US")["within_budget"] is False
+        assert not mon.request_optimization("WEN.US")
+        assert "1055.00 USDC; лимит 1000" in mon.prices_text(["WEN.US"])
+        return
+    row = await mon.quote(("WEN.US", FORWARD))
+    assert row is not None and row["acquired_raw"] == 1_000_000
+    assert row["cost_raw"] == int(Decimal(rfq_price) * 10**6)
+    assert row["size_feasible"]
+    assert mon.snapshot()["candidates"] == 1
+    assert "cost_cap" not in mon.model_blocks(row)
+
+
 async def test_reverse_rfq_session_rejection_is_visible_and_not_a_runtime_error(monitor):
     mon, _ = monitor
     mon.assets["WEN.US"] = replace(mon.assets["WEN.US"], sessions=())

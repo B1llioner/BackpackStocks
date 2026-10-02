@@ -7,7 +7,7 @@ from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -52,6 +52,8 @@ BLOCK_LABELS = {
     "rfq_check_stale": "проверка RFQ устарела",
     "rfq_check_pending": "доступность покупки RFQ ещё не проверена",
     "rfq_budget_changed": "RFQ не укладывается в бюджет",
+    "budget_below_minimum_lot": "минимальный лот дороже лимита",
+    "below_withdrawal_minimum": "объём ниже минимума вывода",
     "nonpositive_net": "нет положительного net после расходов",
     "insufficient_liquidity": "не хватает ликвидности на заданный объём",
     "insufficient_tick_coverage": "достигнут лимит загруженных tick arrays",
@@ -352,9 +354,7 @@ class SpreadMonitor:
         constraints = next((s for s in asset.sessions if s["name"] == session), None)
         if constraints is None:
             raise ValueError("No quantity constraints for observed session")
-        budget = min(dec(self.settings.monitor.notional_usdc), dec(p.max_cost_usdc))
-        if notional is not None:
-            budget = min(budget, notional)
+        budget = self.budget(asset, observation, notional)
         ask_with_fee = dec(observation.ask) * (1 + Decimal(p.backpack_fee_bps) / 10000)
         quantity = floor_step(
             min(budget / ask_with_fee, dec(constraints["maxQuantity"])), dec(constraints["stepSize"])
@@ -368,6 +368,86 @@ class SpreadMonitor:
         if acquired <= fee or ui(request, asset.decimals) < asset.withdrawal_min:
             raise ValueError("Below withdrawal minimum after fee")
         return acquired, acquired - fee
+
+    def planning_observation(self, asset: Asset) -> Observation:
+        obs = self.observation(asset)
+        check = self.rfq.latest.get((asset.symbol, "Bid"))
+        if (
+            check
+            and check.price
+            and check.session == self.quantity_session(obs)
+            and check.eligible(self.clock())
+        ):
+            obs = obs.model_copy(update={"ask": check.price})
+        return obs
+
+    def minimum_buy(self, asset: Asset, obs: Observation) -> Decimal:
+        session = self.quantity_session(obs)
+        constraints = next(s for s in asset.sessions if s["name"] == session)
+        step = dec(constraints["stepSize"])
+        withdrawal = asset.withdrawal_min
+        if self.settings.policy.withdrawal_semantics == "additional":
+            withdrawal += asset.fee
+        quantity = max(
+            dec(constraints["minQuantity"]), withdrawal, asset.fee + Decimal(1).scaleb(-asset.decimals)
+        )
+        quantity = (quantity / step).to_integral_value(rounding=ROUND_CEILING) * step
+        if quantity > dec(constraints["maxQuantity"]):
+            raise RfqUnavailable("rfq_invalid_quantity")
+        return quantity
+
+    def size_floor(self, asset: Asset, obs: Observation) -> Decimal:
+        return (
+            self.minimum_buy(asset, obs)
+            * dec(obs.ask)
+            * (1 + Decimal(self.settings.policy.backpack_fee_bps) / 10000)
+        )
+
+    def size_ceiling(self, asset: Asset, obs: Observation) -> Decimal:
+        session = self.quantity_session(obs)
+        constraints = next(s for s in asset.sessions if s["name"] == session)
+        quantity = floor_step(dec(constraints["maxQuantity"]), dec(constraints["stepSize"]))
+        return quantity * dec(obs.ask) * (1 + Decimal(self.settings.policy.backpack_fee_bps) / 10000)
+
+    def budget(self, asset: Asset, obs: Observation, notional: Decimal | None = None) -> Decimal:
+        initial = dec(self.settings.monitor.notional_usdc)
+        if self.settings.monitor.auto_size:
+            return min(
+                self.size_ceiling(asset, obs),
+                max(self.size_floor(asset, obs), initial if notional is None else notional),
+            )
+        cap = min(initial, dec(self.settings.policy.max_cost_usdc))
+        return cap if notional is None else min(cap, notional)
+
+    def next_budget(self, key: tuple[str, str]) -> Decimal:
+        asset = self.assets[key[0]]
+        obs = self.planning_observation(asset)
+        return self.volume_search.next(
+            key,
+            self.budget(asset, obs),
+            self.clock(),
+            auto_size=self.settings.monitor.auto_size,
+            minimum=self.size_floor(asset, obs),
+            maximum=self.size_ceiling(asset, obs),
+        )
+
+    def budget_info(self, symbol: str) -> dict:
+        asset = self.assets.get(symbol)
+        if asset is None:
+            return {}
+        try:
+            obs = self.planning_observation(asset)
+            minimum = self.size_floor(asset, obs)
+            cap = min(dec(self.settings.monitor.notional_usdc), dec(self.settings.policy.max_cost_usdc))
+            return {
+                "minimum_buy_quantity": str(self.minimum_buy(asset, obs)),
+                "minimum_cost_usdc": str(minimum),
+                "budget_usdc": str(cap),
+                "within_budget": self.settings.monitor.auto_size or minimum <= cap,
+                "auto_size": self.settings.monitor.auto_size,
+            }
+        except (ValueError, KeyError, TypeError, ArithmeticError, StopIteration):
+            return {}
 
     def sale_quantity(self, asset: Asset, observation: Observation, output_raw: int) -> int:
         session = self.quantity_session(observation)
@@ -415,11 +495,13 @@ class SpreadMonitor:
             if self.chain.get(asset.symbol) != "verified_unit_mapping":
                 continue
             try:
-                observation = self.observation(asset)
+                observation = self.planning_observation(asset)
                 session = self.quantity_session(observation)
             except (ValueError, KeyError, TypeError):
                 continue
-            size_probe = (asset.symbol, FORWARD) in self.optimization_requested and self.size_refusal(asset)
+            size_probe = (
+                self.settings.monitor.auto_size or (asset.symbol, FORWARD) in self.optimization_requested
+            ) and self.size_refusal(asset)
             if config.rfq_validation and self.rfq.blocked(asset.symbol, session) and not size_probe:
                 continue
             if config.rfq_validation and not self.rfq_ready(asset, session) and not size_probe:
@@ -438,8 +520,8 @@ class SpreadMonitor:
                 if direction == FORWARD:
                     try:
                         self.sizing(asset, observation)
-                    except (ValueError, KeyError, TypeError, ArithmeticError):
-                        self.failures[key] = "notional_or_session_or_withdrawal_constraint"
+                    except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+                        self.failures[key] = error_code(error)
                         self.failure_causes[key] = [self.failures[key]]
                         continue
                 else:
@@ -500,8 +582,16 @@ class SpreadMonitor:
     async def validated_buy(
         self, asset: Asset, obs: Observation, *, notional: Decimal | None = None
     ) -> tuple[int, int, Observation, RfqCheck]:
-        acquired, delivered = self.sizing(asset, obs, notional=notional)
         session = self.quantity_session(obs)
+        try:
+            acquired, delivered = self.sizing(asset, obs, notional=notional)
+        except ValueError as error:
+            if error_code(error) not in {"budget_below_minimum_lot", "below_withdrawal_minimum"}:
+                raise
+            # A model price cannot rule out a legal minimum lot. Probe it without
+            # acceptance, then enforce the original budget against the real ask.
+            acquired = raw(self.minimum_buy(asset, obs), asset.decimals)
+            delivered = acquired - raw(asset.fee, asset.decimals)
         # FMV can be below the real ask. Resize down and request that exact size again.
         for _ in range(3):
             check = await self.rfq.check(asset.symbol, str(ui(acquired, asset.decimals)), session)
@@ -528,10 +618,10 @@ class SpreadMonitor:
             session = self.quantity_session(self.observation(asset))
         except (ValueError, KeyError, TypeError):
             return True
-        return bool(
-            self.rfq.blocked(asset.symbol, session)
-            or (direction == REVERSE and self.rfq.blocked(asset.symbol, session, "Ask"))
-        )
+        buy_block = self.rfq.blocked(asset.symbol, session)
+        if self.settings.monitor.auto_size and buy_block and buy_block.reason in SIZE_REFUSALS:
+            buy_block = None
+        return bool(buy_block or (direction == REVERSE and self.rfq.blocked(asset.symbol, session, "Ask")))
 
     def rfq_ready(self, asset: Asset, session: str) -> bool:
         check = self.rfq.latest.get((asset.symbol, "Bid"))
@@ -545,14 +635,19 @@ class SpreadMonitor:
         return bool(check and check.reason in SIZE_REFUSALS)
 
     async def refresh_rfq_asset(self, asset: Asset) -> None:
+        session = "UNAVAILABLE"
         try:
-            await self.validated_buy(asset, self.observation(asset))
+            obs = self.observation(asset)
+            session = self.quantity_session(obs)
+            await self.validated_buy(asset, obs)
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            self.failures[(asset.symbol, FORWARD)] = error_code(error)
+            self.failure_causes[(asset.symbol, FORWARD)] = [error_code(error)]
             previous = self.rfq.latest.get((asset.symbol, "Bid"))
             if previous is None or self.clock() >= previous.eligibility_until:
-                check = self.rfq.result(asset.symbol, "Bid", "0", "UNAVAILABLE", "unknown", error_code(error))
+                check = self.rfq.result(asset.symbol, "Bid", "0", session, "unknown", error_code(error))
                 self.rfq.latest[(asset.symbol, "Bid")] = check
         if self.assets.get(asset.symbol) != asset:
             self.rfq.invalidate(asset.symbol)
@@ -608,11 +703,19 @@ class SpreadMonitor:
             asset = self.assets[symbol]
             obs = self.observation(asset)
             p = self.settings.policy
-            budget = min(dec(self.settings.monitor.notional_usdc), dec(p.max_cost_usdc))
-            if notional is not None:
-                budget = min(budget, notional)
+            budget = self.budget(asset, obs, notional)
             if budget <= 0:
                 raise ValueError("Invalid size budget")
+            if direction == FORWARD:
+                # Fractional budget probes must respect the active session's lot
+                # and withdrawal floor, while never increasing the hard cap.
+                floor = self.size_floor(asset, self.planning_observation(asset))
+                cap = (
+                    self.size_ceiling(asset, obs)
+                    if self.settings.monitor.auto_size
+                    else min(dec(self.settings.monitor.notional_usdc), dec(p.max_cost_usdc))
+                )
+                budget = min(cap, max(budget, floor))
             rfq_check = None
             if self.settings.monitor.rfq_validation and (
                 direction == FORWARD or not self.rfq_ready(asset, self.quantity_session(obs))
@@ -620,6 +723,8 @@ class SpreadMonitor:
                 buy_acquired, buy_delivered, obs, rfq_check = await self.validated_buy(
                     asset, obs, notional=budget
                 )
+                if direction == FORWARD and self.settings.monitor.auto_size:
+                    budget = self.budget(asset, obs, budget)
             if direction == FORWARD:
                 acquired, delivered = (
                     (buy_acquired, buy_delivered)
@@ -735,7 +840,7 @@ class SpreadMonitor:
                 "dex_wallet_context": bool(quote.get("taker")),
                 "route_markets": quote_markets(quote),
                 "passes_model_limits": obs.session != "MODEL"
-                and cost <= raw(p.max_cost_usdc)
+                and (self.settings.monitor.auto_size or cost <= raw(p.max_cost_usdc))
                 and profit >= raw(p.min_profit_usdc)
                 and edge >= p.min_edge_bps
                 and impact <= dec(p.max_price_impact_pct)
@@ -803,6 +908,8 @@ class SpreadMonitor:
             raise
         except Exception as error:
             code = error_code(error)
+            if direction == FORWARD and code in SIZE_REFUSALS and "budget" in locals():
+                self.volume_search.refuse(key, budget, self.clock())
             expected = code in MARKET_BLOCKS or isinstance(error, QuoteUnavailable) and error.expected
             self.failures[key] = code
             self.failure_causes[key] = error.codes if isinstance(error, QuoteUnavailable) else [code]
@@ -821,7 +928,7 @@ class SpreadMonitor:
                 api_code=getattr(error, "api_code", None),
             )
             self.results.pop(key, None)  # Failed refresh never retains an actionable old opportunity.
-            if not isinstance(error, RfqUnavailable):
+            if not expected and not isinstance(error, RfqUnavailable):
                 self.quote_failures[key] += 1
                 delay = min(60, self.settings.monitor.quote_refresh_s * 2 ** min(self.quote_failures[key], 3))
                 self.retry_after[key] = self.clock() + delay
@@ -893,11 +1000,8 @@ class SpreadMonitor:
                     self.optimization_requested.discard(selected)
                     self.pending[selected] = asyncio.create_task(self.optimize(selected))
                 else:
-                    cap = min(
-                        dec(self.settings.monitor.notional_usdc), dec(self.settings.policy.max_cost_usdc)
-                    )
                     self.pending[selected] = asyncio.create_task(
-                        self.quote(selected, notional=self.volume_search.next(selected, cap, self.clock()))
+                        self.quote(selected, notional=self.next_budget(selected))
                     )
             version = self.backpack.stock_feed.version
             try:
@@ -944,7 +1048,7 @@ class SpreadMonitor:
             code
             for code, failed in (
                 ("backpack_rfq_unconfirmed", row.get("backpack_model") is True),
-                ("cost_cap", row["cost_raw"] > raw(p.max_cost_usdc)),
+                ("cost_cap", not self.settings.monitor.auto_size and row["cost_raw"] > raw(p.max_cost_usdc)),
                 ("profit_below_minimum", row["profit_raw"] < raw(p.min_profit_usdc)),
                 ("edge_below_minimum", dec(row["edge_bps"]) < p.min_edge_bps),
                 ("price_impact_limit", dec(row["price_impact_pct"]) > dec(p.max_price_impact_pct)),
@@ -1095,7 +1199,7 @@ class SpreadMonitor:
                         row["source"] = observation.source
                         row["passes_model_limits"] = (
                             observation.session != "MODEL"
-                            and row["cost_raw"] <= raw(p.max_cost_usdc)
+                            and (self.settings.monitor.auto_size or row["cost_raw"] <= raw(p.max_cost_usdc))
                             and row["profit_raw"] >= raw(p.min_profit_usdc)
                             and dec(row["edge_bps"]) >= p.min_edge_bps
                             and dec(row["price_impact_pct"]) <= dec(p.max_price_impact_pct)
@@ -1179,6 +1283,7 @@ class SpreadMonitor:
                 rfq_state=status["state"],
                 rfq_reason=status["reason"],
                 fresh=(symbol, FORWARD) in fresh_keys,
+                **self.budget_info(symbol),
             )
             if record.get("dex_price") is not None:
                 record["quote_age_s"] = max(0, now - record["updated_at"])
@@ -1201,6 +1306,7 @@ class SpreadMonitor:
             else self.quote_backend,
             "universe": len(self.assets),
             "notional_usdc": config.notional_usdc,
+            "auto_size": config.auto_size,
             "unit_verified": sum(value == "verified_unit_mapping" for value in self.chain.values()),
             "metadata_age_s": now - self.metadata_at if self.metadata_at else None,
             "batch_price_age_s": now - self.prices_at if self.prices_at else None,
@@ -1288,6 +1394,8 @@ class SpreadMonitor:
             return False
         now = self.clock()
         for direction in (FORWARD, REVERSE):
+            if direction == FORWARD and self.budget_info(symbol).get("within_budget") is False:
+                continue
             if (direction == REVERSE and not asset.deposit_enabled) or self.rfq_cooldown(asset, direction):
                 continue
             if now < self.retry_after.get((symbol, direction), 0):
@@ -1305,6 +1413,7 @@ class SpreadMonitor:
         if (
             asset is None
             or self.chain.get(symbol) != "verified_unit_mapping"
+            or self.budget_info(symbol).get("within_budget") is False
             or self.rfq_cooldown(asset, FORWARD)
             and not self.size_refusal(asset)
         ):
@@ -1318,12 +1427,28 @@ class SpreadMonitor:
 
     async def optimize(self, key: tuple[str, str]) -> None:
         """Bounded exact-size search occupying one ordinary scheduler slot."""
-        cap = min(dec(self.settings.monitor.notional_usdc), dec(self.settings.policy.max_cost_usdc))
+        asset = self.assets[key[0]]
+        cap = self.budget(asset, self.planning_observation(asset))
         samples: list[dict] = []
         try:
             async with asyncio.timeout(35):
                 for fraction in VolumeSearch.fractions:
-                    row = await self.quote(key, notional=cap * fraction)
+                    # Many fractions collapse to the same legal whole-share lot.
+                    # Spend the provider slot only once per sized quantity.
+                    try:
+                        asset = self.assets[key[0]]
+                        obs = self.planning_observation(asset)
+                        budget = (
+                            self.next_budget(key)
+                            if self.settings.monitor.auto_size
+                            else min(cap, max(cap * fraction, self.size_floor(asset, obs)))
+                        )
+                        quantity, _ = self.sizing(asset, obs, notional=budget)
+                    except (ValueError, KeyError, TypeError, ArithmeticError):
+                        continue
+                    if any(r["acquired_raw"] == quantity for r in samples):
+                        continue
+                    row = await self.quote(key, notional=budget)
                     if row is not None:
                         samples.append(dict(row))
                     if self.rfq_cooldown(self.assets[key[0]], key[1]) and not self.size_refusal(
@@ -1337,10 +1462,15 @@ class SpreadMonitor:
                         if feasible
                         else min(samples, key=lambda r: r["cost_raw"])
                     )
-                    # Refine around the coarse winner, while preserving the hard cap.
+                    ceiling = (
+                        self.size_ceiling(asset, self.planning_observation(asset))
+                        if self.settings.monitor.auto_size
+                        else cap
+                    )
+                    # Refine the winner inside the provider's legal size range.
                     for budget in (
                         max(cap / 32, dec(best["search_budget_usdc"]) - cap / 16),
-                        min(cap, dec(best["search_budget_usdc"]) + cap / 16),
+                        min(ceiling, dec(best["search_budget_usdc"]) + cap / 16),
                     ):
                         if any(dec(r["search_budget_usdc"]) == budget for r in samples):
                             continue
@@ -1430,7 +1560,12 @@ class SpreadMonitor:
 
         rows = [r for r in snapshot["rows"] if selected(r) and r["fresh"] and r.get("profit_raw", 0) > 0][:5]
         prices = [r for r in snapshot.get("prices", []) if selected(r)]
-        lines = [f"Котировки: {len(prices)} свежих · объём до {self.settings.monitor.notional_usdc} USDC"]
+        size = (
+            "автоподбор объёма без потолка USDC"
+            if self.settings.monitor.auto_size
+            else f"объём до {self.settings.monitor.notional_usdc} USDC"
+        )
+        lines = [f"Котировки: {len(prices)} свежих · {size}"]
         if snapshot.get("rfq_validation"):
             lines[0] += f" · RFQ {snapshot['rfq_available_assets']}/{snapshot['universe']}"
         if snapshot.get("last_quote_at"):
@@ -1471,7 +1606,7 @@ class SpreadMonitor:
         interval = snapshot["price_repeat_median_s"]
         cadence = f"повтор цены ~{interval:.0f}с" if interval is not None else "цены по очереди"
         lines = [
-            f"Цены · до {self.settings.monitor.notional_usdc} USDC · {page}/{total}",
+            f"Цены · {'автообъём, без потолка USDC' if self.settings.monitor.auto_size else 'до ' + self.settings.monitor.notional_usdc + ' USDC'} · {page}/{total}",
             f"RFQ каждые {self.settings.monitor.rfq_cache_s:g}с; {cadence} "
             f"(запрос ≥{self.quote_provider.interval:g}с).",
             f"Свежими считаются цены до {self.settings.monitor.max_quote_age_s:g}с. Время МСК.",
@@ -1508,6 +1643,10 @@ class SpreadMonitor:
                 lines.append("BP / DEX: котировки нет")
             if record["rfq_state"] != "available":
                 lines.append(block_text([record["rfq_reason"]]))
+            if record.get("within_budget") is False:
+                lines.append(
+                    f"Мин. {record['minimum_buy_quantity']} шт ≈ {dec(record['minimum_cost_usdc']):.2f} USDC; лимит {record['budget_usdc']}. Кол исключён по объёму."
+                )
         return "\n".join(lines)
 
 

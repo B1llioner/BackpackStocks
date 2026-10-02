@@ -21,6 +21,7 @@ from solders.signature import Signature
 from .models import TOKEN, TOKEN_2022, USDC_MINT
 from .observability import error_code, event
 from .solana import SolanaRPC
+from .wallet_stream import WalletStream
 
 if TYPE_CHECKING:
     from .monitor import SpreadMonitor
@@ -247,12 +248,39 @@ class WalletWatcher:
     ):
         self.journal, self.rpc, self.monitor, self.clock = journal, rpc, monitor, clock
         self.task: asyncio.Task | None = None
+        self.stream_task: asyncio.Task | None = None
+        self.decoder_task: asyncio.Task | None = None
+        self.decode_lock = asyncio.Lock()
+        self.decode_ready = asyncio.Event()
+        self.stream = (
+            WalletStream(rpc.url, rpc.proxy, self.queue_signature) if isinstance(rpc, SolanaRPC) else None
+        )
         self.lock: TextIO | None = None
         self.last_poll = 0.0
         self.last_error: str | None = None
         self.last_discovery: dict[str, float] = {}
         self.last_cleanup = 0.0
         self.initial_focus: dict[str, set[str]] = defaultdict(set)
+
+    def queue_signature(self, wallet: str, signature: str) -> None:
+        signature = signature_id(signature)
+        if not self.journal.db.execute("SELECT 1 FROM wallets WHERE address=?", (wallet,)).fetchone():
+            return
+        inserted = self.journal.db.execute(
+            "INSERT OR IGNORE INTO transactions(wallet,signature,historical) VALUES(?,?,0)",
+            (wallet, signature),
+        ).rowcount
+        if inserted:
+            self.decode_ready.set()
+
+    def update_stream(self) -> None:
+        if self.stream:
+            self.stream.update(
+                {
+                    r["address"]: r["wallet"]
+                    for r in self.journal.db.execute("SELECT address,wallet FROM accounts")
+                }
+            )
 
     def focus_recent_history(self) -> None:
         if self.monitor is None:
@@ -414,7 +442,8 @@ class WalletWatcher:
             ):
                 context["reason"] = "recent_monitor_quote"
         # A wallet observation prioritizes a new calculation, never an automatic trade.
-        self.monitor.request_refresh(symbol)
+        context["refresh_requested"] = self.monitor.request_refresh(symbol)
+        context.update(self.monitor.budget_info(symbol))
         return context
 
     async def poll_once(self) -> None:
@@ -438,6 +467,12 @@ class WalletWatcher:
                 except Exception as error:
                     self.last_error = error_code(error)
                     event("wallet_poll_error", component="wallet_watch", code=self.last_error)
+        self.update_stream()
+        async with self.decode_lock:
+            await self.decode_pending()
+        self.last_poll = self.clock()
+
+    async def decode_pending(self) -> None:
         pending = self.journal.db.execute(
             "SELECT * FROM transactions WHERE state='pending' AND retry_at<=? "
             "ORDER BY historical,rowid LIMIT 4",
@@ -470,6 +505,7 @@ class WalletWatcher:
                     signature=record["signature"],
                     state=record["kind"],
                     quantity=record["usdc_raw"],
+                    elapsed_s=max(0, self.clock() - record["block_time"]),
                 )
             except Exception as error:
                 self.last_error = error_code(error)
@@ -479,7 +515,21 @@ class WalletWatcher:
                     (self.clock() + delay, item["wallet"], item["signature"]),
                 )
                 event("wallet_decode_error", component="wallet_watch", code=self.last_error)
-        self.last_poll = self.clock()
+
+    async def decode_loop(self) -> None:
+        while True:
+            self.decode_ready.clear()
+            try:
+                if self.monitor is None or self.monitor.assets:
+                    async with self.decode_lock, asyncio.timeout(30):
+                        await self.decode_pending()
+            except Exception as error:
+                self.last_error = error_code(error)
+                event("wallet_decode_loop_error", component="wallet_watch", code=self.last_error)
+            try:
+                await asyncio.wait_for(self.decode_ready.wait(), 1)
+            except TimeoutError:
+                pass
 
     def start(self) -> None:
         self.lock = open(str(self.journal.path) + ".poll.lock", "a+")
@@ -490,6 +540,10 @@ class WalletWatcher:
             self.lock = None
             return  # Another runtime owns polling; this runtime can still read/register.
         self.task = asyncio.create_task(self.loop())
+        self.decoder_task = asyncio.create_task(self.decode_loop())
+        self.update_stream()
+        if self.stream:
+            self.stream_task = asyncio.create_task(self.stream.run())
 
     async def loop(self) -> None:
         while True:
@@ -506,9 +560,10 @@ class WalletWatcher:
             await asyncio.sleep(max(1, POLL_S - (self.clock() - started)))
 
     async def close(self) -> None:
-        if self.task:
-            self.task.cancel()
-            await asyncio.gather(self.task, return_exceptions=True)
+        tasks = [t for t in (self.task, self.stream_task, self.decoder_task) if t]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self.lock:
             fcntl.flock(self.lock, fcntl.LOCK_UN)
             self.lock.close()
@@ -522,15 +577,28 @@ class WalletWatcher:
         accounts = self.journal.db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] - len(wallets)
         cadence = max(POLL_S, ((accounts + 1) // 2) * POLL_S)
         stamp = local_time(checked) if checked else "ожидает первого запроса"
-        lines = [
-            f"Транзакции · finalized · проверка {stamp} МСК",
-            f"Кошелёк каждые {POLL_S}с; token accounts по очереди ~{cadence}с.",
-        ]
+        stream_active = self.stream and self.stream.connected and self.stream.subscribed
+        lines = [f"Транзакции · finalized · проверка {stamp} МСК"]
+        if stream_active:
+            lines.append(
+                f"Поток транзакций: {self.stream.subscribed} подписок; HTTP-страховка кошелька каждые {POLL_S}с."
+            )
+        else:
+            lines.append(f"Поток недоступен; HTTP кошелька каждые {POLL_S}с, token accounts ~{cadence}с.")
         if self.last_error:
             lines.append(f"Последняя ошибка: {self.last_error}; повтор включён.")
         for row in wallets:
             lines.append(f"https://solscan.io/account/{row['address']}")
-        lines.extend(activity_text(r) for r in self.journal.activities(symbol=symbol))
+        for record in self.journal.activities(symbol=symbol):
+            # Historical correlation stays intact; current refresh/budget status
+            # is rendered truthfully instead of repeating a stale queue promise.
+            context = dict(record.get("correlation", {}))
+            legs = [leg for leg in record["legs"] if leg["asset"]]
+            if self.monitor and len(legs) == 1 and context.get("reason") == "no_contemporaneous_quote":
+                context.update(self.monitor.budget_info(legs[0]["asset"]))
+                context["refresh_requested"] = self.monitor.request_refresh(legs[0]["asset"])
+                record["correlation"] = context
+            lines.append(activity_text(record))
         return "\n\n".join(lines)
 
 
@@ -569,7 +637,15 @@ def activity_text(record: dict) -> str:
         )
     reason = record.get("correlation", {}).get("reason")
     if reason == "no_contemporaneous_quote":
-        lines.append("У монитора нет котировки на момент сделки; обновление запрошено.")
+        context = record["correlation"]
+        if context.get("within_budget") is False:
+            lines.append(
+                f"Нет котировки на момент сделки. Сейчас минимум {context['minimum_buy_quantity']} шт ≈ {Decimal(context['minimum_cost_usdc']):.2f} USDC > лимита {context['budget_usdc']}; кол исключён по объёму."
+            )
+        elif context.get("refresh_requested"):
+            lines.append("Нет котировки на момент сделки; новый расчёт поставлен в очередь.")
+        else:
+            lines.append("Нет котировки на момент сделки; новый расчёт пока недоступен.")
     elif reason == "recent_monitor_quote":
         comparison = record["correlation"]
         lines.append(

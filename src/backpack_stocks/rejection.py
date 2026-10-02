@@ -38,6 +38,8 @@ def api_error_metadata(payload: object) -> dict:
             result["reason"] = "insufficient_balance"
         elif "insufficient collateral" in normalized:
             result["reason"] = "insufficient_collateral"
+        elif "rfq" in normalized and "expired" in normalized:
+            result["reason"] = "rfq_expired"
         elif any(text in normalized for text in ("no route found", "could not find any route")):
             result["reason"] = "no_route"
     return result

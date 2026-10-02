@@ -369,6 +369,38 @@ async def test_queued_alert_disappears_after_its_rfq_or_dex_price_expires(bot):
     assert render() is None
 
 
+async def test_alert_cooldown_starts_only_after_delivery_and_expired_alert_can_retry(bot):
+    from test_rfq_validation import monitored
+
+    from backpack_stocks.monitor import FORWARD
+
+    controller, _ = bot
+    controller.queue_replies = True
+    controller.engine.settings.telegram_spread_alerts = True
+    mon, clock = monitored()
+    await mon.quote(("WEN.US", FORWARD))
+    controller.engine.monitor = mon
+    snapshot = mon.snapshot()
+    await controller.announce_candidates(snapshot)
+    await controller.announce_candidates(snapshot)
+    assert controller.outbox.qsize() == 1
+    key = "spread_alert:WEN.US:backpack_to_jupiter"
+    assert controller.engine.store.get_meta(key) is None
+    clock.now += 8
+    worker = asyncio.create_task(controller.send_replies())
+    try:
+        await asyncio.wait_for(controller.outbox.join(), 1)
+        assert not controller.pending_alerts and controller.engine.store.get_meta(key) is None
+        mon.backpack.stock_feed.latest["WEN"].timestamp = clock()
+        await mon.quote(("WEN.US", FORWARD))
+        await controller.announce_candidates(mon.snapshot())
+        await asyncio.wait_for(controller.outbox.join(), 1)
+        assert controller.engine.store.get_meta(key) is not None
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
 @pytest.mark.parametrize(
     "text", ["/resume --live", "/resume FLWS", "/resume@another_bot", "/exec rm", "/live", "/withdraw"]
 )

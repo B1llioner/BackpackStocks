@@ -9,6 +9,7 @@ from solders.signature import Signature
 
 from backpack_stocks.models import STOCK_MINT, TOKEN, TOKEN_2022, USDC_MINT
 from backpack_stocks.solana import SolanaRPC
+from backpack_stocks.wallet_stream import WalletStream
 from backpack_stocks.wallet_watch import TITAN, WalletJournal, WalletWatcher, decode_activity
 
 WALLET = str(Pubkey.from_bytes(bytes([7]) * 32))
@@ -17,6 +18,42 @@ OTHER = str(Pubkey.from_bytes(bytes([8]) * 32))
 
 def sig(number=1):
     return str(Signature.from_bytes(bytes([number]) * 64))
+
+
+async def test_stream_signature_is_durable_deduplicated_and_decoded_without_http_sweep(journal):
+    rpc = SimpleNamespace(transaction=AsyncMock(return_value=transaction()))
+    monitor = SimpleNamespace(
+        assets={"PUSA.US": SimpleNamespace(mint=STOCK_MINT, symbol="PUSA.US")},
+        results={},
+        request_refresh=lambda s: False,
+        budget_info=lambda s: {},
+    )
+    watcher = WalletWatcher(journal, rpc, monitor, clock=lambda: 1005)
+    stream = WalletStream("https://example.test/rpc", None, watcher.queue_signature)
+    payload = {
+        "method": "logsNotification",
+        "params": {"subscription": 42, "result": {"value": {"signature": sig()}}},
+    }
+    stream.ingest(payload, {42: WALLET})
+    stream.ingest(payload, {42: WALLET})
+    assert journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    assert watcher.decode_ready.is_set()
+    await watcher.decode_pending()
+    assert len(journal.notifications()) == 1
+    assert journal.notifications()[0]["correlation"]["refresh_requested"] is False
+
+
+def test_unknown_stream_subscription_cannot_enqueue_wallet_activity(journal):
+    watcher = WalletWatcher(journal, None, None)
+    stream = WalletStream("https://example.test", None, watcher.queue_signature)
+    stream.ingest(
+        {
+            "method": "logsNotification",
+            "params": {"subscription": 99, "result": {"value": {"signature": sig()}}},
+        },
+        {42: WALLET},
+    )
+    assert journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
 
 
 def balance(index, mint, owner, units, decimals=6):
@@ -156,6 +193,7 @@ async def test_null_transaction_is_retried_and_notification_survives_restart(jou
         results={},
         request_refresh=lambda s: True,
         request_optimization=lambda s: True,
+        budget_info=lambda s: {},
     )
     watcher = WalletWatcher(journal, rpc, monitor, clock=lambda: 1005)
     watcher.discover_accounts = AsyncMock()
@@ -198,6 +236,7 @@ def test_correlation_rejects_quote_received_after_trade(journal):
         settings=SimpleNamespace(monitor=SimpleNamespace(max_quote_age_s=15)),
         request_refresh=lambda s: True,
         request_optimization=lambda s: True,
+        budget_info=lambda s: {},
     )
     watcher = WalletWatcher(journal, None, monitor, clock=lambda: 1008)
     record = decode_activity(transaction(), WALLET, sig(), {STOCK_MINT: "PUSA.US"})

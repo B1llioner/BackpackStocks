@@ -199,6 +199,16 @@ def amount(value: int) -> str:
 
 
 def status_text(engine: Engine) -> str:
+    if engine.monitor and engine.settings.monitor.auto_size:
+        snapshot = engine.monitor.snapshot()
+        return (
+            f"Режим: {engine.settings.mode} · монитор {snapshot['universe']} акций\n"
+            "Объём: автоподбор без потолка USDC\n"
+            f"RFQ: {snapshot['rfq_available_assets']}/{snapshot['universe']}; "
+            f"свежих котировок: {snapshot['fresh_quotes']}; колов: {snapshot['candidates']}\n"
+            f"RFQ обновляется каждые {engine.settings.monitor.rfq_cache_s:g}с; "
+            f"срок свежести {engine.settings.monitor.max_quote_age_s:g}с."
+        )
     status = engine.status()
     active = status["active"]
     completed = [c for c in status["cycles"] if c["phase"] == Phase.COMPLETE]
@@ -237,6 +247,7 @@ class TelegramController:
         )
         self.reply_sequence = itertools.count()
         self.delivery_callbacks: dict[int, Callable[[bool], None]] = {}
+        self.pending_alerts: set[str] = set()
         self.control_lock = asyncio.Lock()
         self.command_tasks: set[asyncio.Task] = set()
         self.account_task: asyncio.Task | None = None
@@ -258,6 +269,8 @@ class TelegramController:
                 await self.api.reply(self.allowed_user_id, current)
                 if on_result:
                     on_result(True)
+            elif on_result:
+                on_result(False)
             return
         item = (priority, next(self.reply_sequence), text, kind, render)
         if on_result:
@@ -362,17 +375,28 @@ class TelegramController:
                 key += ":restricted"
             previous = float(self.engine.store.get_meta(key) or "0")
             now = self.clock()
-            if now - previous < self.engine.settings.telegram_alert_cooldown_s:
+            if key in self.pending_alerts or now - previous < self.engine.settings.telegram_alert_cooldown_s:
                 continue
-            await self.reply(
-                self.alert_text(row),
-                priority=5,
-                kind="alert",
-                render=partial(self.current_alert, row["asset"], row["direction"])
-                if self.engine.monitor
-                else None,
-            )
-            self.engine.store.set_meta(key, str(now))
+            self.pending_alerts.add(key)
+
+            def delivered(ok: bool, *, alert_key: str = key) -> None:
+                self.pending_alerts.discard(alert_key)
+                if ok:
+                    self.engine.store.set_meta(alert_key, str(self.clock()))
+
+            try:
+                await self.reply(
+                    self.alert_text(row),
+                    priority=5,
+                    kind="alert",
+                    render=partial(self.current_alert, row["asset"], row["direction"])
+                    if self.engine.monitor
+                    else None,
+                    on_result=delivered,
+                )
+            except BaseException:
+                self.pending_alerts.discard(key)
+                raise
             self.engine.store.event(
                 None,
                 "spread_alert",
@@ -628,12 +652,15 @@ class TelegramController:
             if monitor is None or selected not in monitor.assets:
                 return "Акция не найдена в мониторе."
             if not monitor.request_optimization(selected):
+                budget = monitor.budget_info(selected)
+                if budget.get("within_budget") is False:
+                    return f"{selected}: минимальный лот {budget['minimum_buy_quantity']} шт ≈ {float(budget['minimum_cost_usdc']):.2f} USDC выше лимита {budget['budget_usdc']}. /prices {selected}"
                 return f"{selected}: расчёт уже идёт или RFQ сейчас недоступна. /spread {selected}"
             task = asyncio.create_task(self.deliver_search(selected))
             self.command_tasks.add(task)
             task.add_done_callback(self.command_tasks.discard)
             return (
-                f"{selected}: подбор объёма до {monitor.settings.monitor.notional_usdc} USDC запущен. "
+                f"{selected}: подбор объёма {'без потолка USDC' if monitor.settings.monitor.auto_size else 'до ' + monitor.settings.monitor.notional_usdc + ' USDC'} запущен. "
                 f"Проверю несколько размеров и повторно запрошу лучший. Результат: /spread {selected}."
             )
         if command == "account":

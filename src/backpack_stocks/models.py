@@ -117,6 +117,7 @@ class MonitorPolicy(StrictModel):
     jupiter_data_dir: str = "data/jupiter"
     jupiter_wallet_env: str = "JUPITER_QUOTE_WALLET"
     notional_usdc: str = "100"
+    auto_size: bool = False
     metadata_s: float = Field(default=300, ge=30)
     price_batch_s: float = Field(default=10, ge=2)
     quote_refresh_s: float = Field(default=5, ge=1)

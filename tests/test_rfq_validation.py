@@ -69,6 +69,20 @@ async def test_exact_size_cache_best_prices_and_only_await_accept():
     bp.accept_rfq.assert_not_called()
 
 
+async def test_expired_query_is_unknown_and_expired_cancellation_is_expected(caplog):
+    clock = Clock()
+    bp, validator = setup(clock)
+    bp.rfqs.side_effect = RemoteError("API rejected request: HTTP 400", status_code=400, reason="rfq_expired")
+    bp.cancel_rfq.side_effect = RemoteError(
+        "API rejected request: HTTP 400", status_code=400, reason="rfq_expired"
+    )
+    result = await validator.check("BLK.US", "1", "POST_MARKET")
+    assert result.state == "unknown" and result.reason == "rfq_expired_before_check"
+    assert not result.usable(clock())
+    bp.accept_rfq.assert_not_called()
+    assert "rfq_cancel_failed" not in caplog.text
+
+
 async def test_inspection_covers_the_entire_short_acceptance_window(monkeypatch):
     clock = Clock()
     bp, validator = setup(clock)
