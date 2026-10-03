@@ -205,3 +205,34 @@ async def test_quote_age_includes_http_latency_and_limits_status_is_complete(mon
         quote = await reader.quote_pair(STOCK_MINT, USDC_MINT, 1)
         assert now[0] - quote["_observed_at"] == 4
         assert reader.status()["queued"] == reader.status()["cooldown_s"] == 0
+
+
+@pytest.mark.parametrize("slippage", [0, 25, 50, 51, -1, None, True, 0.5, "50"])
+async def test_manual_frontend_accepts_tighter_firm_quotes_but_never_wider_slippage(slippage):
+    settings = Settings()
+    replay = type("Replay", (), {})()
+    replay.order = AsyncMock(
+        return_value={
+            "requestedAt": time.time(),
+            "quote": {
+                "inputMint": USDC_MINT,
+                "outputMint": STOCK_MINT,
+                "inAmount": "100",
+                "outAmount": "1000",
+                "otherAmountThreshold": "1000",
+                "swapMode": "ExactIn",
+                "slippageBps": slippage,
+                "priceImpact": "0.1",
+                "router": "jupiterz",
+                "requestId": "fixture",
+                "transaction": "discard-me",
+            },
+        }
+    )
+    reader = JupiterFlowQuotes(settings, replay=replay)
+    if type(slippage) is int and 0 <= slippage <= 50:
+        quote = await reader.quote_pair(USDC_MINT, STOCK_MINT, 100)
+        assert quote["slippageBps"] == slippage and "transaction" not in quote
+    else:
+        with pytest.raises(ValueError, match="slippage"):
+            await reader.quote_pair(USDC_MINT, STOCK_MINT, 100)

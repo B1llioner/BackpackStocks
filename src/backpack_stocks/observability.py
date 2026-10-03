@@ -88,8 +88,10 @@ REASONS = {
     "No quantity constraints for observed session": "rfq_session_unavailable",
     "No RFQ trading session is open": "rfq_session_unavailable",
     "Reverse deposit/mint mapping unavailable": "reverse_unavailable",
+    "Frontend slippage exceeds monitor policy or is invalid": "slippage_limit",
 }
 MARKET_BLOCKS = {
+    "slippage_limit",
     "pool_disabled",
     "pool_not_open",
     "empty_reserves",

@@ -479,7 +479,7 @@ class SpreadMonitor:
     def size_ceiling(self, asset: Asset, obs: Observation) -> Decimal:
         if obs.session == SPOT_SESSION:
             market = self.books.markets[asset.symbol]
-            total = self.books.quantity_ceiling(asset.symbol, "Bid")
+            total = self.books.affordable_quantity_ceiling(asset.symbol)
             quantity = floor_step(min(total, market.maximum) if market.maximum else total, market.step)
             return ui(self.books.fill(asset.symbol, raw(quantity), "Bid").value_raw)
         constraints = self.quantity_rules(asset, obs)
@@ -792,8 +792,24 @@ class SpreadMonitor:
             try:
                 obs = self.books.observation(asset.symbol)
                 acquired, delivered = self.sizing(asset, obs, notional=budget)
-                fill = self.books.fill(asset.symbol, acquired, "Bid")
-                await self.books.check_capacity(asset.symbol, fill)
+                for attempt in range(3):
+                    fill = self.books.fill(asset.symbol, acquired, "Bid")
+                    try:
+                        await self.books.check_capacity(asset.symbol, fill)
+                        break
+                    except BookUnavailable as error:
+                        if (
+                            error.code != "spot_insufficient_balance"
+                            or attempt == 2
+                            or not self.settings.monitor.auto_size
+                        ):
+                            raise
+                        maximum = self.books.capacities[(asset.symbol, "Bid")].quantity
+                        quantity = floor_step(maximum, self.books.markets[asset.symbol].step)
+                        if quantity < self.minimum_buy(asset, obs) or raw(quantity) >= acquired:
+                            raise
+                        acquired = raw(quantity)
+                        delivered = acquired - raw(asset.fee)
                 candidates.append((acquired, delivered, obs, None, fill, fill.value_raw))
             except Exception as error:
                 failures.append(error)

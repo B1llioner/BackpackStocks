@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 
 from .backpack import Backpack
-from .models import Observation, dec, raw, ui
+from .models import Observation, dec, floor_step, raw, ui
 from .observability import QuoteUnavailable, event
 
 SPOT_SESSION = "BACKPACK_SPOT"
@@ -348,6 +348,24 @@ class StockBooks:
         market, depth = self.markets[asset], self.depth(asset)
         quantity = sum((q for _, q in depth.tradable(market, side)), Decimal(0))
         return min(quantity, market.maximum) if market.maximum is not None else quantity
+
+    def affordable_quantity_ceiling(self, asset: str) -> Decimal:
+        quantity = self.quantity_ceiling(asset, "Bid")
+        capacity = self.capacities.get((asset, "Bid"))
+        market, depth = self.markets[asset], self.depth(asset)
+        if (
+            capacity
+            and 0 <= self.clock() - capacity.checked_at < self.ttl
+            and capacity.fee_bps == self.fee_bps
+            and depth.asks[0][0] <= capacity.price
+        ):
+            reduced = floor_step(min(quantity, capacity.quantity), market.step)
+            if reduced < market.minimum:
+                raise BookUnavailable("spot_insufficient_balance")
+            fill = self.fill(asset, raw(reduced), "Bid")
+            if dec(fill.worst_price) <= capacity.price:
+                return reduced
+        return quantity
 
     async def check_capacity(self, asset: str, fill: BookFill) -> None:
         market = self.markets[asset]

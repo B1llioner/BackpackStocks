@@ -282,7 +282,7 @@ async def test_balance_refusal_blocks_call_and_adaptive_search_shrinks(monitor):
 
     async def capacity(symbol, side, price):
         result = limit(symbol, side, price)
-        result["maxOrderQuantity"] = "1"
+        result["maxOrderQuantity"] = "0.1"
         return result
 
     mon.backpack.max_order_quantity.side_effect = capacity
@@ -407,3 +407,29 @@ async def test_unconfirmed_fmv_does_not_override_verified_book_entry(monitor):
     mon.backpack.stock_feed.latest["WEN"] = observed(clock, ask="1", bid="100")
     assert (await mon.entry_buy(mon.assets["WEN.US"], Decimal("100")))[4] is not None
     assert (await mon.entry_sell(mon.assets["WEN.US"], raw("15")))[3] is not None
+
+
+async def test_auto_book_buy_resizes_to_actual_funds_and_caches_natural_ceiling(monitor):
+    mon, clock = monitor
+    await setup_books(mon, clock)
+    close_rfq(mon, clock)
+    mon.settings.monitor.auto_size = True
+
+    async def capacity(symbol, side, price):
+        answer = limit(symbol, side, price)
+        answer["maxOrderQuantity"] = "1.005"
+        return answer
+
+    mon.backpack.max_order_quantity.side_effect = capacity
+
+    async def dex(source, target, units, **kwargs):
+        return {"outAmount": str(units * 7), "priceImpact": "0.1"}
+
+    mon.jupiter.quote_pair.side_effect = dex
+    row = await mon.quote(("WEN.US", FORWARD), notional=Decimal("100"))
+    assert row and row["acquired_raw"] == 1_000_000 and row["cost_raw"] == 6_006_100
+    assert mon.snapshot()["signal_candidates"] == 1
+    assert mon.backpack.max_order_quantity.await_count == 2
+    assert mon.size_ceiling(mon.assets["WEN.US"], mon.books.observation("WEN.US")) == Decimal("6.0061")
+    assert mon.next_budget(("WEN.US", FORWARD)) <= Decimal("6.0061")
+    mon.backpack.order.assert_not_awaited()

@@ -69,8 +69,14 @@ class JupiterFlowQuotes:
         Jupiter.validate_quote(q, source, target, amount)
         if q.get("swapMode") != "ExactIn" or not 0 < int(q["otherAmountThreshold"]) <= int(q["outAmount"]):
             raise ValueError("Invalid frontend minimum output or swap mode")
-        if self.policy.jupiter_profile == "manual" and int(q.get("slippageBps", -1)) != self.slippage:
-            raise ValueError("Frontend slippage differs from monitor policy")
+        # Firm JupiterZ quotes can have zero slippage even when manual requests
+        # specify a nonzero maximum. A tighter quote is safe: the monitor still
+        # reserves its own policy minimum and never accepts a looser allowance.
+        slippage = q.get("slippageBps")
+        if self.policy.jupiter_profile == "manual" and (
+            type(slippage) is not int or not 0 <= slippage <= self.slippage
+        ):
+            raise ValueError("Frontend slippage exceeds monitor policy or is invalid")
         # The order endpoint may return an unsigned transaction. Discard it; the
         # monitor has no execution API, wallet key, signature or transaction journal.
         return {
