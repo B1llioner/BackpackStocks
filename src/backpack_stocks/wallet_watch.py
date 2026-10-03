@@ -322,6 +322,12 @@ class WalletWatcher:
                 "backpack_timestamp",
                 "backpack_price",
                 "backpack_rfq_valid_until",
+                "backpack_valid_until",
+                "backpack_source",
+                "backpack_market",
+                "backpack_fee_bps",
+                "book_levels",
+                "book_fee_raw",
                 "cost_raw",
                 "profit_raw",
                 "delivered_raw",
@@ -438,7 +444,8 @@ class WalletWatcher:
                 -self.monitor.settings.monitor.max_quote_age_s <= offset <= 0
                 and row["observed_at"] <= record["block_time"]
                 and row["backpack_timestamp"] <= record["block_time"]
-                and (row.get("backpack_rfq_valid_until") or 0) > record["block_time"]
+                and (row.get("backpack_valid_until") or row.get("backpack_rfq_valid_until") or 0)
+                > record["block_time"]
             ):
                 context["reason"] = "recent_monitor_quote"
         # A wallet observation prioritizes a new calculation, never an automatic trade.

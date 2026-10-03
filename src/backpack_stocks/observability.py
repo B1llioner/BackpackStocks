@@ -50,6 +50,8 @@ FIELDS = {
     "reason",
     "api_code",
     "backpack_price",
+    "backpack_source",
+    "backpack_market",
     "dex_price",
     "quoted_output_raw",
     "minimum_output_raw",

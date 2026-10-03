@@ -199,7 +199,11 @@ def main():
                 names.extend([settings.backpack_seed_env, settings.wallet_seed_env])
             elif settings.backpack_private_reads:
                 names.append(settings.backpack_seed_env)
-            elif settings.source == "public" and settings.monitor.enabled and settings.monitor.rfq_validation:
+            elif (
+                settings.source == "public"
+                and settings.monitor.enabled
+                and (settings.monitor.rfq_validation or settings.monitor.spot_books)
+            ):
                 names.append(settings.backpack_seed_env)
         if args.command == "serve":
             names.append(settings.api_token_env)
@@ -212,7 +216,7 @@ def main():
                 raise ValueError("Monitor requires source=public and a positive duration")
             if settings.dex_backend == "jupiter" or settings.monitor.quote_backend == "jupiter":
                 names.append(settings.jupiter_key_env)
-            if settings.monitor.rfq_validation:
+            if settings.monitor.rfq_validation or settings.monitor.spot_books:
                 names.append(settings.backpack_seed_env)
         if names:
             if (
@@ -254,7 +258,9 @@ def main():
                 from .backpack import BackpackAuth
 
                 bp, jup, rpc = public_clients(settings)
-                if settings.monitor.rfq_validation and os.environ.get(settings.backpack_seed_env):
+                if (settings.monitor.rfq_validation or settings.monitor.spot_books) and os.environ.get(
+                    settings.backpack_seed_env
+                ):
                     bp.auth = BackpackAuth(os.environ[settings.backpack_seed_env])
                 monitor = SpreadMonitor(settings, bp, jup, rpc)
                 await monitor.start()

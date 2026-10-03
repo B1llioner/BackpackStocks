@@ -232,9 +232,11 @@ def status_text(engine: Engine) -> str:
             f"Режим: {engine.settings.mode} · монитор {snapshot['universe']} акций\n"
             "Объём: автоподбор без потолка USDC\n"
             f"RFQ: {snapshot['rfq_available_assets']}/{snapshot['universe']}; "
+            f"стаканы: {snapshot.get('spot_available_assets', 0)}/{snapshot.get('spot_markets', 0)}; "
             f"свежих котировок: {snapshot['fresh_quotes']}; "
             f"сигналов сейчас: {snapshot.get('signal_candidates', snapshot['candidates'])}\n"
             f"RFQ обновляется каждые {engine.settings.monitor.rfq_cache_s:g}с; "
+            f"стаканы каждые {engine.settings.monitor.spot_refresh_s:g}с; "
             f"срок свежести {engine.settings.monitor.max_quote_age_s:g}с."
         )
         closed = session_text(snapshot)

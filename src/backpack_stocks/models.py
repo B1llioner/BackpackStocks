@@ -106,6 +106,8 @@ class Policy(StrictModel):
 
 class MonitorPolicy(StrictModel):
     enabled: bool = True
+    spot_books: bool = True
+    spot_refresh_s: float = Field(default=2, ge=1, le=30)
     rfq_validation: bool = True
     rfq_timeout_s: float = Field(default=5, ge=1, le=15)
     rfq_retry_s: float = Field(default=120, ge=10, le=600)

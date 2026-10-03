@@ -75,7 +75,9 @@ async def runtime(settings: Settings):
             clients.extend([backpack, jupiter, rpc])
             if settings.backpack_private_reads:
                 backpack.auth = BackpackAuth(required_env(settings.backpack_seed_env))
-            elif settings.monitor.enabled and settings.monitor.rfq_validation:
+            elif settings.monitor.enabled and (
+                settings.monitor.rfq_validation or settings.monitor.spot_books
+            ):
                 seed = os.environ.get(settings.backpack_seed_env)
                 if seed:
                     backpack.auth = BackpackAuth(seed)

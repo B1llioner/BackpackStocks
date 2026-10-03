@@ -138,6 +138,22 @@ class Backpack:
     async def account(self) -> dict:
         return await self.private("GET", "/api/v1/account", "accountQuery")
 
+    async def max_order_quantity(self, symbol: str, side: str, price: str) -> dict:
+        if side not in {"Bid", "Ask"}:
+            raise ValueError("Invalid order side")
+        return await self.private(
+            "GET",
+            "/api/v1/account/limits/order",
+            "maxOrderQuantity",
+            symbol=symbol,
+            side=side,
+            price=price,
+            reduceOnly=False,
+            autoBorrow=False,
+            autoBorrowRepay=False,
+            autoLendRedeem=False,
+        )
+
     async def submit_rfq(
         self, quantity: str, client_id: int, side: str = "Bid", *, symbol: str = "WEN.US_USDC_RFQ"
     ) -> dict:
