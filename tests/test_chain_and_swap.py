@@ -10,7 +10,7 @@ from solders.pubkey import Pubkey
 
 from backpack_stocks.models import STOCK_MINT, TOKEN, TOKEN_2022, USDC_MINT, Policy
 from backpack_stocks.raydium import decode_clmm
-from backpack_stocks.sessions import active_session, validate_quantity
+from backpack_stocks.sessions import active_session, next_session_open, validate_quantity
 from backpack_stocks.solana import assert_stock_mint, decode_token, transaction_deltas
 from backpack_stocks.swap_guard import decode_route, validate_instructions, validate_simulation
 
@@ -227,3 +227,67 @@ def test_session_timezone_dst_holiday_and_quantity_rules():
     validate_quantity(security, "REGULAR", "1")
     with pytest.raises(ValueError):
         validate_quantity(security, "REGULAR", "1.5")
+
+
+@pytest.mark.parametrize(
+    "now, expected",
+    [
+        ("2026-01-03T08:00:00+00:00", "2026-01-05T14:30:00+00:00"),
+        ("2026-07-04T08:00:00+00:00", "2026-07-06T13:30:00+00:00"),
+    ],
+)
+def test_next_session_uses_weekdays_and_dst(now, expected):
+    sessions = [
+        {
+            "name": "REGULAR",
+            "startTime": "09:30:00",
+            "endTime": "16:00:00",
+            "timezone": "America/New_York",
+            "startWeekday": 1,
+            "endWeekday": 5,
+        }
+    ]
+    assert next_session_open(sessions, [], datetime.fromisoformat(now)) == datetime.fromisoformat(expected)
+
+
+def test_next_session_resumes_after_full_or_partial_holiday():
+    sessions = [
+        {
+            "name": "REGULAR",
+            "startTime": "09:30:00",
+            "endTime": "16:00:00",
+            "timezone": "America/New_York",
+            "startWeekday": 1,
+            "endWeekday": 5,
+        }
+    ]
+    holiday = {"market": "US_EQUITIES", "date": "2026-07-06", "timezone": "America/New_York"}
+    before = datetime(2026, 7, 4, 8, tzinfo=UTC)
+    assert next_session_open(sessions, [holiday], before) == datetime(2026, 7, 7, 13, 30, tzinfo=UTC)
+    partial = {**holiday, "startTime": "10:00:00", "endTime": "12:00:00"}
+    assert next_session_open(sessions, [partial], datetime(2026, 7, 6, 15, tzinfo=UTC)) == datetime(
+        2026, 7, 6, 16, tzinfo=UTC
+    )
+    opened = datetime(2026, 7, 6, 14, tzinfo=UTC)
+    assert next_session_open(sessions, [], opened) == opened
+    assert next_session_open([], [], before) is None
+
+
+def test_overnight_opens_sunday_and_can_resume_at_midnight_after_holiday():
+    sessions = [
+        {
+            "name": "OVERNIGHT",
+            "startTime": "20:00:00",
+            "endTime": "04:00:00",
+            "timezone": "America/New_York",
+            "startWeekday": 7,
+            "endWeekday": 4,
+        }
+    ]
+    assert next_session_open(sessions, [], datetime(2026, 10, 3, 8, tzinfo=UTC)) == datetime(
+        2026, 10, 5, 0, tzinfo=UTC
+    )
+    holiday = {"market": "US_EQUITIES", "date": "2026-10-05", "timezone": "America/New_York"}
+    assert next_session_open(sessions, [holiday], datetime(2026, 10, 5, 18, tzinfo=UTC)) == datetime(
+        2026, 10, 6, 4, tzinfo=UTC
+    )

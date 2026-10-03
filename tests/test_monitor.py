@@ -1,6 +1,7 @@
 import asyncio
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -331,6 +332,39 @@ async def test_high_impact_is_reported_but_cannot_be_candidate(monitor):
     mon.jupiter.quote_pair.return_value = {"outAmount": "104495958", "priceImpact": "5"}
     await mon.quote(("WEN.US", FORWARD))
     assert not mon.snapshot()["rows"][0]["candidate"]
+    assert mon.snapshot()["rows"][0]["signal_eligible"]
+
+
+def test_closed_market_reports_next_opening_instead_of_claiming_no_spread(monitor):
+    mon, clock = monitor
+    clock.now = datetime(2026, 10, 3, 8, tzinfo=UTC).timestamp()
+    mon.metadata_at = clock()
+    mon.sessions = [
+        {
+            "name": "US_EQUITIES_OVERNIGHT",
+            "startTime": "20:00:00",
+            "endTime": "04:00:00",
+            "timezone": "America/New_York",
+            "startWeekday": 7,
+            "endWeekday": 4,
+        }
+    ]
+    snapshot = mon.snapshot()
+    assert snapshot["rfq_session_state"] == "closed"
+    assert snapshot["rfq_next_open_at"] == datetime(2026, 10, 5, 0, tzinfo=UTC).timestamp()
+    assert snapshot["signal_candidates"] == 0
+    for text in (mon.text(), mon.prices_text()):
+        assert "RFQ-сессия закрыта" in text and "05.10 03:00 МСК" in text
+        assert "Положительных спредов после расходов нет" not in text
+    clock.now += mon.settings.monitor.metadata_s * 2 + 1
+    assert mon.snapshot()["rfq_session_state"] == "unknown"
+    assert mon.snapshot()["rfq_next_open_at"] is None
+
+
+def test_zero_quotes_cannot_be_presented_as_zero_profitable_spreads(monitor):
+    mon, _ = monitor
+    assert "Свежих полных котировок пока нет" in mon.text()
+    assert "Положительных спредов после расходов нет" not in mon.text()
 
 
 async def test_mint_changed_during_quote_discards_result(monitor):

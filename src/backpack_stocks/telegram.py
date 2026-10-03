@@ -131,11 +131,16 @@ class TelegramAPI:
             logger.removeFilter(self._redactor)
         self._proxy_redactor.close()
 
-    async def call(self, method: str, **payload):
+    async def call(self, method: str, *, refresh_payload: Callable[[], dict | None] | None = None, **payload):
         if method not in {"getMe", "getWebhookInfo", "getUpdates", "setMyCommands", "sendMessage"}:
             raise ValueError("Unsupported Telegram method")
         try:
             await self.limiter.acquire(category=method)
+            if refresh_payload is not None:
+                current = refresh_payload()
+                if current is None:
+                    return None
+                payload = current
             timeout = (
                 httpx.Timeout(8, connect=5, write=5, pool=5)
                 if method == "sendMessage"
@@ -171,7 +176,26 @@ class TelegramAPI:
             raise TelegramError()
         return result
 
-    async def reply(self, user_id: int, text: str) -> None:
+    async def reply(
+        self, user_id: int, text: str, *, render: Callable[[], str | None] | None = None
+    ) -> str | None:
+        if render is not None:
+            # A call fits in one message. Recheck it after Telegram's throttle,
+            # immediately before HTTP submission, not before the rate-limit wait.
+            sent = None
+
+            def refresh() -> dict | None:
+                nonlocal sent
+                sent = render()
+                if sent is None:
+                    return None
+                if len(sent) > 3900:
+                    raise ValueError("Refreshed alert exceeds one Telegram message")
+                return {"chat_id": user_id, "text": sent, "protect_content": True}
+
+            await self.call("sendMessage", refresh_payload=refresh)
+            return sent
+        original = text
         # Keep every ticker. Telegram's length limit must not silently truncate
         # the end of a price page or a diagnostic report.
         chunks = []
@@ -184,6 +208,7 @@ class TelegramAPI:
         chunks.append(text)
         for chunk in chunks:
             await self.call("sendMessage", chat_id=user_id, text=chunk, protect_content=True)
+        return original
 
 
 def credentials() -> tuple[str, int]:
@@ -200,15 +225,20 @@ def amount(value: int) -> str:
 
 def status_text(engine: Engine) -> str:
     if engine.monitor and engine.settings.monitor.auto_size:
+        from .monitor import session_text
+
         snapshot = engine.monitor.snapshot()
-        return (
+        text = (
             f"Режим: {engine.settings.mode} · монитор {snapshot['universe']} акций\n"
             "Объём: автоподбор без потолка USDC\n"
             f"RFQ: {snapshot['rfq_available_assets']}/{snapshot['universe']}; "
-            f"свежих котировок: {snapshot['fresh_quotes']}; колов: {snapshot['candidates']}\n"
+            f"свежих котировок: {snapshot['fresh_quotes']}; "
+            f"сигналов сейчас: {snapshot.get('signal_candidates', snapshot['candidates'])}\n"
             f"RFQ обновляется каждые {engine.settings.monitor.rfq_cache_s:g}с; "
             f"срок свежести {engine.settings.monitor.max_quote_age_s:g}с."
         )
+        closed = session_text(snapshot)
+        return text + ("\n" + closed if closed else "")
     status = engine.status()
     active = status["active"]
     completed = [c for c in status["cycles"] if c["phase"] == Phase.COMPLETE]
@@ -266,9 +296,9 @@ class TelegramController:
         if not self.queue_replies:
             current = render() if render else text
             if current is not None:
-                await self.api.reply(self.allowed_user_id, current)
+                sent = await self.send_reply(current, kind, render)
                 if on_result:
-                    on_result(True)
+                    on_result(sent)
             elif on_result:
                 on_result(False)
             return
@@ -293,31 +323,62 @@ class TelegramController:
                 callback = self.delivery_callbacks.pop(dropped[1], None)
                 if callback:
                     callback(False)
-                event("telegram_outbox_drop", level="WARNING", component="telegram")
+                event(
+                    "telegram_outbox_drop",
+                    level="WARNING",
+                    component="telegram",
+                    state=dropped[3],
+                    reason="queue_full",
+                )
             for old in queued:
                 self.outbox.put_nowait(old)
         else:
             self.outbox.put_nowait(item)
 
+    def record_delivery(self, text: str, kind: str) -> None:
+        self.engine.store.event(None, "telegram_reply_sent", {"characters": len(text), "kind": kind})
+        event("telegram_delivered", component="telegram", state=kind)
+
+    async def send_reply(self, text: str, kind: str, render: Callable[[], str | None] | None) -> bool:
+        if kind == "alert" and render is not None:
+            current = await self.api.reply(self.allowed_user_id, text, render=render)
+            if current is None:
+                event(
+                    "telegram_outbox_drop",
+                    component="telegram",
+                    state=kind,
+                    reason="expired_or_ineligible",
+                )
+                return False
+            text = current if isinstance(current, str) else text
+        else:
+            await self.api.reply(self.allowed_user_id, text)
+        self.record_delivery(text, kind)
+        return True
+
     async def send_replies(self) -> None:
         while True:
-            _, sequence, text, _, render = await self.outbox.get()
+            _, sequence, text, kind, render = await self.outbox.get()
             delivered = False
             for attempt in range(3):
                 try:
                     current = render() if render else text
                     if current is None:
+                        event(
+                            "telegram_outbox_drop",
+                            component="telegram",
+                            state=kind,
+                            reason="expired_or_ineligible",
+                        )
                         break  # Expired opportunities must never leave the outbox.
-                    await self.api.reply(self.allowed_user_id, current)
-                    delivered = True
-                    self.engine.store.event(None, "telegram_reply_sent", {"characters": len(current)})
-                    event("telegram_delivered", component="telegram")
+                    delivered = await self.send_reply(current, kind, render)
                     break
                 except TelegramError as error:
                     event(
                         "telegram_send_error",
                         level="WARNING" if error.transient else "ERROR",
                         component="telegram",
+                        state=kind,
                         status_code=error.code,
                         attempt=attempt + 1,
                     )
@@ -326,7 +387,7 @@ class TelegramController:
                         raise
                     # Retrying a reply never re-executes a trading/control action.
                     if attempt == 2:
-                        event("telegram_delivery_failed", level="ERROR", component="telegram")
+                        event("telegram_delivery_failed", level="ERROR", component="telegram", state=kind)
                     else:
                         await asyncio.sleep(error.retry_after)
             callback = self.delivery_callbacks.pop(sequence, None)
@@ -338,9 +399,17 @@ class TelegramController:
         from .monitor import compact_quote
 
         lines = ["СПРЕД НАЙДЕН · расчёт", *compact_quote(row)]
-        if not row.get("candidate"):
+        if not row.get("candidate") and not row.get("candidate_blocks"):
             lines[-1] += ". Автоисполнение не разрешено."
         return "\n".join(lines)
+
+    @staticmethod
+    def eligible_alert(row: dict) -> bool:
+        return bool(
+            row.get("fresh")
+            and row.get("profit_raw", 0) > 0
+            and row.get("signal_eligible", row.get("candidate") or row.get("net_profitable"))
+        )
 
     def current_alert(self, asset: str, direction: str) -> str | None:
         monitor = self.engine.monitor
@@ -350,25 +419,15 @@ class TelegramController:
             (r for r in monitor.snapshot()["rows"] if r["asset"] == asset and r["direction"] == direction),
             None,
         )
-        if (
-            row
-            and row.get("fresh")
-            and row.get("profit_raw", 0) > 0
-            and (row.get("candidate") or row.get("net_profitable"))
-        ):
+        if row and self.eligible_alert(row):
             return self.alert_text(row)
         return None
 
     async def announce_candidates(self, snapshot: dict) -> None:
         if not self.engine.settings.telegram_spread_alerts:
             return
-        for row in [
-            r
-            for r in snapshot["rows"]
-            if (r.get("candidate") or r.get("net_profitable"))
-            and r.get("fresh")
-            and r.get("profit_raw", 0) > 0
-        ][:5]:
+        queued = 0
+        for row in (r for r in snapshot["rows"] if self.eligible_alert(r)):
             key = f"spread_alert:{row['asset']}:{row['direction']}"
             if not row.get("candidate"):
                 # A restricted discovery must not suppress a newly eligible entry.
@@ -379,10 +438,19 @@ class TelegramController:
                 continue
             self.pending_alerts.add(key)
 
-            def delivered(ok: bool, *, alert_key: str = key) -> None:
+            def delivered(
+                ok: bool,
+                *,
+                alert_key: str = key,
+                asset: str = row["asset"],
+                direction: str = row["direction"],
+            ) -> None:
                 self.pending_alerts.discard(alert_key)
                 if ok:
                     self.engine.store.set_meta(alert_key, str(self.clock()))
+                kind = "spread_alert_delivered" if ok else "spread_alert_dropped"
+                self.engine.store.event(None, kind, {"asset": asset, "direction": direction})
+                event(kind, component="telegram", asset=asset, direction=direction, delivered=ok)
 
             try:
                 await self.reply(
@@ -417,6 +485,9 @@ class TelegramController:
                 edge_bps=row["edge_bps"],
                 qualified=bool(row.get("candidate")),
             )
+            queued += 1
+            if queued >= 5:
+                break
 
     async def initialize(self) -> None:
         me = await self.api.call("getMe")

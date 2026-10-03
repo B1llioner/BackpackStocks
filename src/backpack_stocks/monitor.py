@@ -20,7 +20,7 @@ from .models import STOCK_MINT, USDC_MINT, Observation, Settings, dec, floor_ste
 from .observability import MARKET_BLOCKS, QuoteUnavailable, error_code, event
 from .proxy import resolve_proxy
 from .rfq_validation import SIZE_REFUSALS, RfqCheck, RfqUnavailable, RfqValidator
-from .sessions import active_session
+from .sessions import active_session, next_session_open
 from .solana import SolanaRPC, assert_stock_mint
 from .stock_money import StockValueCalculator
 from .volume_search import VolumeSearch
@@ -1057,6 +1057,19 @@ class SpreadMonitor:
             if failed
         ]
 
+    def session_status(self, now: float) -> dict:
+        status = {"rfq_session_state": "unknown", "rfq_session": None, "rfq_next_open_at": None}
+        if not self.sessions or not 0 <= now - self.metadata_at <= self.settings.monitor.metadata_s * 2:
+            return status
+        moment = datetime.fromtimestamp(now, UTC)
+        session = active_session(self.sessions, self.holidays, moment)
+        opening = None if session else next_session_open(self.sessions, self.holidays, moment)
+        return {
+            "rfq_session_state": "open" if session else "closed",
+            "rfq_session": session,
+            "rfq_next_open_at": opening.timestamp() if opening else None,
+        }
+
     def snapshot(self, *, include_hidden: bool = False) -> dict:
         now, config = self.clock(), self.settings.monitor
         rows = []
@@ -1246,6 +1259,18 @@ class SpreadMonitor:
                     and row.get("backpack_quote_confirmed")
                     and fresh
                 )
+                # Informational calls expose every validated positive minimum
+                # net. Trading thresholds continue to control candidate only.
+                row["signal_eligible"] = bool(
+                    direction_eligible
+                    and result
+                    and fresh
+                    and positive
+                    and all(
+                        code in {"profit_below_minimum", "edge_below_minimum", "price_impact_limit"}
+                        for code in row["candidate_blocks"]
+                    )
+                )
                 if rfq_eligible and screen is not None:
                     screened_assets.add(asset.symbol)
                 if direction_eligible and result and fresh:
@@ -1299,6 +1324,7 @@ class SpreadMonitor:
         latency = sorted(self.latencies)
         return {
             "observed_at": now,
+            **self.session_status(now),
             "dex_backend": self.settings.dex_backend,
             "quote_backend": self.quote_backend,
             "quote_source": "jupiter_flow"
@@ -1319,6 +1345,7 @@ class SpreadMonitor:
             "price_batch_period_s": self.price_batch_period(),
             "fresh_quotes": len(prices),
             "candidates": sum(r["candidate"] for r in rows),
+            "signal_candidates": sum(r["signal_eligible"] for r in rows),
             "completed_quotes": self.completed_quotes,
             "fresh_calculations": fresh_calculations,
             "stock_value_backend": self.stock_values.backend,
@@ -1558,7 +1585,16 @@ class SpreadMonitor:
                 "report_keys" not in snapshot or (r["asset"], r["direction"]) in keys
             )
 
-        rows = [r for r in snapshot["rows"] if selected(r) and r["fresh"] and r.get("profit_raw", 0) > 0][:5]
+        rows = [
+            r
+            for r in snapshot["rows"]
+            if selected(r) and r["fresh"] and r.get("signal_eligible", True) and r.get("profit_raw", 0) > 0
+        ][:5]
+        rejected = [
+            r
+            for r in snapshot["rows"]
+            if selected(r) and r["fresh"] and r.get("signal_eligible") is False and r.get("profit_raw", 0) > 0
+        ]
         prices = [r for r in snapshot.get("prices", []) if selected(r)]
         size = (
             "автоподбор объёма без потолка USDC"
@@ -1570,17 +1606,29 @@ class SpreadMonitor:
             lines[0] += f" · RFQ {snapshot['rfq_available_assets']}/{snapshot['universe']}"
         if snapshot.get("last_quote_at"):
             lines.append(f"Последнее обновление: {quote_time(snapshot['last_quote_at'])}")
+        session_message = session_text(snapshot)
+        if session_message:
+            lines.append(session_message)
         if rows:
             for row in rows:
                 lines.extend(["", *compact_quote(row)])
         else:
-            lines.append("Положительных спредов после расходов нет.")
+            if snapshot.get("rfq_session_state") != "closed":
+                lines.append(
+                    "Свежие расчёты не прошли проверки."
+                    if rejected
+                    else "Положительных спредов после расходов нет."
+                    if prices
+                    else "Свежих полных котировок пока нет."
+                )
+            for row in rejected[:5]:
+                lines.append(f"{row['asset']}: {block_text(row['candidate_blocks'])}")
             for pair in prices[:5]:
                 lines.append(
                     f"{pair['asset']} {price_direction(pair)}: BP {pair['backpack_price']} / "
                     f"{dex_label(pair)} {pair['dex_price']} · {pair['quote_age_s']:.0f}с"
                 )
-            if symbol and not prices:
+            if symbol and not prices and snapshot.get("rfq_session_state") != "closed":
                 reasons = sorted(
                     {
                         code
@@ -1611,6 +1659,9 @@ class SpreadMonitor:
             f"(запрос ≥{self.quote_provider.interval:g}с).",
             f"Свежими считаются цены до {self.settings.monitor.max_quote_age_s:g}с. Время МСК.",
         ]
+        session_message = session_text(snapshot)
+        if session_message:
+            lines.append(session_message)
         for symbol in selected:
             record = catalog.get(symbol)
             if record is None:
@@ -1693,6 +1744,16 @@ def price_pair(row: dict) -> dict:
     }
 
 
+def session_text(snapshot: dict) -> str | None:
+    if snapshot.get("rfq_session_state") != "closed":
+        return None
+    text = "RFQ-сессия закрыта."
+    if snapshot.get("rfq_next_open_at") is not None:
+        opening = datetime.fromtimestamp(snapshot["rfq_next_open_at"], ZoneInfo("Europe/Moscow"))
+        text += f" Следующее открытие: {opening:%d.%m %H:%M} МСК."
+    return text
+
+
 def compact_quote(row: dict) -> list[str]:
     lines = [
         f"{row['asset']} {price_direction(row)}: +{amount(row['profit_raw'])} USDC "
@@ -1715,7 +1776,7 @@ def compact_quote(row: dict) -> list[str]:
     else:
         lines.append(f"Размер: {amount(row['cost_raw'])} USDC")
     if not row.get("candidate") and row.get("candidate_blocks"):
-        lines.append("Вход ограничен: " + block_text(row["candidate_blocks"]))
+        lines.append("Автоисполнение не разрешено: " + block_text(row["candidate_blocks"]))
     return lines
 
 

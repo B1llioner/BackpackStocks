@@ -36,6 +36,44 @@ def active_session(sessions: list[dict], holidays: list[dict], now: datetime | N
     return None
 
 
+def next_session_open(
+    sessions: list[dict], holidays: list[dict], now: datetime | None = None
+) -> datetime | None:
+    """Find the next opening in the published schedule, including holiday resumes.
+
+    An already open market returns now. Search at most two weeks; missing or
+    fully blocked schedules return None rather than a guessed opening.
+    """
+    now = now or datetime.now(UTC)
+    if active_session(sessions, holidays, now) is not None:
+        return now
+    horizon = now + timedelta(days=14)
+    boundaries: set[datetime] = set()
+    for session in sessions:
+        zone = ZoneInfo(session["timezone"])
+        day = now.astimezone(zone).date()
+        for offset in range(15):
+            start = datetime.fromisoformat(f"{day + timedelta(days=offset)}T{session['startTime']}")
+            boundaries.add(start.replace(tzinfo=zone).astimezone(UTC))
+    for holiday in holidays:
+        if holiday["market"] != "US_EQUITIES":
+            continue
+        zone = ZoneInfo(holiday["timezone"])
+        if holiday.get("startTime") is not None and holiday.get("endTime") is not None:
+            end = datetime.fromisoformat(f"{holiday['date']}T{holiday['endTime']}")
+        else:
+            end = datetime.fromisoformat(holiday["date"]) + timedelta(days=1)
+        boundaries.add(end.replace(tzinfo=zone).astimezone(UTC))
+    return next(
+        (
+            boundary
+            for boundary in sorted(boundaries)
+            if now < boundary <= horizon and active_session(sessions, holidays, boundary) is not None
+        ),
+        None,
+    )
+
+
 def validate_quantity(security: dict, session: str | None, quantity: str) -> None:
     rules = next((s for s in security["sessions"] if s["name"] == session), None)
     if not rules:

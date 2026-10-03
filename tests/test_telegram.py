@@ -391,14 +391,172 @@ async def test_alert_cooldown_starts_only_after_delivery_and_expired_alert_can_r
     try:
         await asyncio.wait_for(controller.outbox.join(), 1)
         assert not controller.pending_alerts and controller.engine.store.get_meta(key) is None
+        assert any(e["kind"] == "spread_alert_dropped" for e in controller.engine.store.events())
         mon.backpack.stock_feed.latest["WEN"].timestamp = clock()
         await mon.quote(("WEN.US", FORWARD))
         await controller.announce_candidates(mon.snapshot())
         await asyncio.wait_for(controller.outbox.join(), 1)
         assert controller.engine.store.get_meta(key) is not None
+        assert any(e["kind"] == "spread_alert_delivered" for e in controller.engine.store.events())
+        sent = next(e for e in controller.engine.store.events() if e["kind"] == "telegram_reply_sent")
+        assert sent["body"]["kind"] == "alert"
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
+
+
+async def test_signal_expiring_inside_telegram_throttle_never_reaches_send_message(bot):
+    from test_rfq_validation import monitored
+
+    from backpack_stocks.monitor import FORWARD
+
+    controller, server = bot
+    controller.engine.settings.telegram_spread_alerts = True
+    mon, clock = monitored()
+    await mon.quote(("WEN.US", FORWARD))
+    controller.engine.monitor = mon
+
+    async def throttle(**kwargs):
+        clock.now += 8
+
+    controller.api.limiter.acquire = AsyncMock(side_effect=throttle)
+    await controller.announce_candidates(mon.snapshot())
+    assert not server.replies()
+    assert controller.engine.store.get_meta("spread_alert:WEN.US:backpack_to_jupiter") is None
+    assert any(e["kind"] == "spread_alert_dropped" for e in controller.engine.store.events())
+    assert not any(e["kind"] == "spread_alert_delivered" for e in controller.engine.store.events())
+
+
+@pytest.mark.parametrize("output, eligible", [("1008000000", True), ("1004000000", False)])
+async def test_small_conservative_profit_alerts_without_changing_execution_thresholds(bot, output, eligible):
+    from test_rfq_validation import monitored
+
+    from backpack_stocks.models import dec
+    from backpack_stocks.monitor import FORWARD
+
+    controller, server = bot
+    controller.engine.settings.telegram_spread_alerts = True
+    mon, _ = monitored()
+    mon.settings.monitor.notional_usdc = "1000"
+    mon.settings.monitor.auto_size = True
+    mon.settings.policy.min_profit_usdc = "5"
+    mon.settings.policy.min_edge_bps = 50
+    mon.jupiter.quote_pair.return_value = {"outAmount": output, "priceImpact": "0.9"}
+    await mon.quote(("WEN.US", FORWARD))
+    controller.engine.monitor = mon
+    snapshot = mon.snapshot()
+    row = mon.snapshot(include_hidden=True)["rows"][0]
+    assert row["quoted_output_raw"] - row["cost_raw"] - row["gas_raw"] > 0
+    assert not row["candidate"] and not row["net_profitable"]
+    assert row["signal_eligible"] is eligible
+    assert snapshot["signal_candidates"] == int(eligible) and snapshot["candidates"] == 0
+    await controller.announce_candidates(snapshot)
+    if eligible:
+        assert 0 < row["profit_raw"] < 5_000_000 and dec(row["edge_bps"]) < 50
+        assert {"profit_below_minimum", "edge_below_minimum"} <= set(row["candidate_blocks"])
+        assert "СПРЕД НАЙДЕН" in server.replies()[-1]["text"]
+        assert "Автоисполнение" in server.replies()[-1]["text"]
+        assert controller.current_alert("WEN.US", FORWARD) is not None
+    else:
+        assert row["profit_raw"] <= 0
+        assert not server.replies() and controller.current_alert("WEN.US", FORWARD) is None
+    assert mon.settings.policy.min_profit_usdc == "5" and mon.settings.policy.min_edge_bps == 50
+    mon.backpack.accept_rfq.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid", ["rfq", "dex", "unconfirmed", "session", "chain", "metadata", "slippage"])
+async def test_new_informational_alert_gate_still_rejects_invalid_data(bot, invalid):
+    from test_rfq_validation import monitored
+
+    from backpack_stocks.monitor import FORWARD
+
+    controller, server = bot
+    controller.engine.settings.telegram_spread_alerts = True
+    mon, clock = monitored()
+    await mon.quote(("WEN.US", FORWARD))
+    row = mon.results[("WEN.US", FORWARD)]
+    if invalid == "rfq":
+        row["backpack_rfq_valid_until"] = clock()
+    elif invalid == "dex":
+        row["dex_observed_at"] = clock() - 9
+    elif invalid == "unconfirmed":
+        row["backpack_quote_confirmed"] = False
+    elif invalid == "session":
+        mon.backpack.stock_feed.latest["WEN"].session = "OVERNIGHT"
+    elif invalid == "chain":
+        mon.chain["WEN.US"] = "unverified"
+    elif invalid == "metadata":
+        mon.metadata_at = clock() - mon.settings.monitor.metadata_s * 2 - 1
+    else:
+        row["slippage_bps"] = mon.settings.policy.slippage_bps + 1
+    controller.engine.monitor = mon
+    assert mon.snapshot()["signal_candidates"] == 0
+    assert not mon.snapshot(include_hidden=True)["rows"][0]["signal_eligible"]
+    await controller.announce_candidates(mon.snapshot())
+    assert not server.replies() and controller.current_alert("WEN.US", FORWARD) is None
+
+
+async def test_explicit_signal_rejection_cannot_fall_back_to_candidate_flag(bot):
+    controller, server = bot
+    controller.engine.settings.telegram_spread_alerts = True
+    await controller.announce_candidates(
+        {
+            "rows": [
+                {
+                    "fresh": True,
+                    "candidate": True,
+                    "net_profitable": True,
+                    "profit_raw": 1,
+                    "signal_eligible": False,
+                }
+            ]
+        }
+    )
+    assert not server.replies()
+
+
+@pytest.mark.parametrize("suppression", ["cooldown", "pending"])
+async def test_top_five_suppressed_signals_do_not_hide_other_fresh_signals(bot, suppression):
+    from test_rfq_validation import monitored
+
+    from backpack_stocks.monitor import FORWARD
+
+    controller, _ = bot
+    controller.queue_replies = True
+    controller.engine.settings.telegram_spread_alerts = True
+    mon, _ = monitored()
+    await mon.quote(("WEN.US", FORWARD))
+    rows = [{**mon.snapshot()["rows"][0], "asset": f"STOCK{i}.US"} for i in range(6)]
+    for row in rows[:5]:
+        key = f"spread_alert:{row['asset']}:{FORWARD}"
+        if suppression == "cooldown":
+            controller.engine.store.set_meta(key, str(controller.clock()))
+        else:
+            controller.pending_alerts.add(key)
+    await controller.announce_candidates({"rows": rows})
+    assert controller.outbox.qsize() == 1
+    assert "STOCK5.US" in controller.outbox.get_nowait()[2]
+
+
+def test_monitor_status_distinguishes_signal_count_and_closed_market(bot):
+    from backpack_stocks.telegram import status_text
+
+    controller, _ = bot
+    controller.engine.settings.monitor.auto_size = True
+    controller.engine.monitor = SimpleNamespace(
+        snapshot=lambda: {
+            "universe": 70,
+            "rfq_available_assets": 0,
+            "fresh_quotes": 0,
+            "signal_candidates": 0,
+            "candidates": 0,
+            "rfq_session_state": "closed",
+            "rfq_next_open_at": 1791158400,
+        }
+    )
+    text = status_text(controller.engine)
+    assert "сигналов сейчас: 0" in text
+    assert "RFQ-сессия закрыта" in text and "05.10 03:00 МСК" in text
 
 
 @pytest.mark.parametrize(
