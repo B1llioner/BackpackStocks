@@ -449,6 +449,18 @@ async def test_sell_rfq_refusal_does_not_block_buy_rfq_direction():
     mon.backpack.accept_rfq.assert_not_awaited()
 
 
+async def test_expired_nonbinding_rfq_is_a_price_block_not_a_runtime_failure():
+    mon, _ = monitored()
+    mon.backpack.rfqs.side_effect = RemoteError(
+        "API rejected request: HTTP 400", status_code=400, reason="rfq_expired"
+    )
+    assert await mon.quote(("WEN.US", FORWARD)) is None
+    assert mon.blocked["rfq_expired_before_check"] == 1 and not mon.errors["quote"]
+    assert mon.snapshot()["signal_candidates"] == 0 and not mon.snapshot()["prices"]
+    mon.jupiter.quote_pair.assert_not_awaited()
+    mon.backpack.accept_rfq.assert_not_awaited()
+
+
 async def test_a_failing_hot_route_backs_off_and_other_stocks_keep_running():
     from dataclasses import replace
 

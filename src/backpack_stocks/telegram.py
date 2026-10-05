@@ -191,7 +191,12 @@ class TelegramAPI:
                     return None
                 if len(sent) > 3900:
                     raise ValueError("Refreshed alert exceeds one Telegram message")
-                return {"chat_id": user_id, "text": sent, "protect_content": True}
+                return {
+                    "chat_id": user_id,
+                    "text": sent,
+                    "protect_content": True,
+                    "link_preview_options": {"is_disabled": True},
+                }
 
             await self.call("sendMessage", refresh_payload=refresh)
             return sent
@@ -207,7 +212,10 @@ class TelegramAPI:
             text = text[end:].lstrip("\n")
         chunks.append(text)
         for chunk in chunks:
-            await self.call("sendMessage", chat_id=user_id, text=chunk, protect_content=True)
+            await self.call(
+                "sendMessage", chat_id=user_id, text=chunk, protect_content=True,
+                link_preview_options={"is_disabled": True},
+            )
         return original
 
 

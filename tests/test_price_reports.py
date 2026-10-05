@@ -5,7 +5,8 @@ from test_monitor import asset
 from test_rfq_validation import monitored, observed
 
 from backpack_stocks.jupiter_replay import JupiterReplay, ReplayError
-from backpack_stocks.monitor import FORWARD, REVERSE
+from backpack_stocks.models import STOCK_MINT, USDC_MINT
+from backpack_stocks.monitor import FORWARD, REVERSE, compact_quote
 from backpack_stocks.rejection import api_error_metadata
 from backpack_stocks.telegram import TelegramAPI
 from backpack_stocks.transport import RemoteError
@@ -120,6 +121,30 @@ async def test_missing_reverse_quote_does_not_claim_a_loss_or_profit_in_that_dir
     text = mon.prices_text(["WEN.US"])
     assert "Jup → BP: нет актуального расчёта" in text
     assert "Jup → BP: УБЫТОК" not in text and "Jup → BP: ПРИБЫЛЬ" not in text
+
+
+@pytest.mark.parametrize("direction", [FORWARD, REVERSE])
+async def test_spread_call_contains_actual_investment_and_directional_exchange_links(direction):
+    from urllib.parse import parse_qs, urlparse
+
+    mon, _ = monitored()
+    if direction == REVERSE:
+        mon.jupiter.quote_pair.return_value = {"outAmount": "18000000", "priceImpact": "0.1"}
+    await mon.quote(("WEN.US", direction))
+    row = mon.snapshot()["rows"][0]
+    text = "\n".join(compact_quote(row))
+    assert "WEN.US" in text and "Чистый спред: +" in text
+    assert "Объём: 100 USDC" in text if direction == REVERSE else "Объём: 99.999986 USDC" in text
+    assert "Backpack: https://backpack.exchange/stocks/WEN" in text
+    jupiter = next(line.removeprefix("Jupiter: ") for line in text.splitlines() if line.startswith("Jupiter:"))
+    query = parse_qs(urlparse(jupiter).query)
+    assert query == {
+        "sell": [STOCK_MINT if direction == FORWARD else USDC_MINT],
+        "buy": [USDC_MINT if direction == FORWARD else STOCK_MINT],
+    }
+    assert jupiter in mon.prices_text(["WEN.US"])
+    assert len(text) < 3900
+    mon.backpack.accept_rfq.assert_not_awaited()
 
 
 async def test_rfq_rejection_has_safe_reason_without_remote_payload():

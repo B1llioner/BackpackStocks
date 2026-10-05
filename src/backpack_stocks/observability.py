@@ -108,6 +108,7 @@ MARKET_BLOCKS = {
     "below_withdrawal_minimum",
     "rfq_session_unavailable",
     "rfq_no_quote",
+    "rfq_expired_before_check",
     "rfq_request_rejected",
     "rfq_insufficient_balance",
     "rfq_invalid_quantity",

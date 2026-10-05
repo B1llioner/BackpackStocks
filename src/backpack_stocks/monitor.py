@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from typing import TYPE_CHECKING
+from urllib.parse import quote as url_quote
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from solders.pubkey import Pubkey
@@ -1698,6 +1700,7 @@ class SpreadMonitor:
             if current_reverse:
                 reverse.update(current_reverse)
             reverse.update(asset=symbol, direction=REVERSE, fresh=(symbol, REVERSE) in fresh_keys)
+            reverse["mint"] = self.assets[symbol].mint
             if reverse.get("updated_at") is not None:
                 reverse["quote_age_s"] = max(0, now - reverse["updated_at"])
             reverse["reasons"] = next(
@@ -1708,6 +1711,7 @@ class SpreadMonitor:
             if "rfq_session_unavailable" in reverse["reasons"]:
                 reverse["rfq_state"] = "unavailable"
             record["reverse"] = reverse
+            record["mint"] = self.assets[symbol].mint
             record["reasons"] = next(
                 (d["reasons"] for d in diagnostics if d["asset"] == symbol and d["direction"] == FORWARD), []
             )
@@ -2126,6 +2130,7 @@ def price_pair(row: dict) -> dict:
     dex_at = row.get("dex_observed_at", row["quote_started_at"])
     return {
         "asset": row["asset"],
+        "mint": row["mint"],
         "direction": row["direction"],
         "quote_backend": row["quote_backend"],
         "backpack_source": row.get("backpack_source", "rfq"),
@@ -2161,20 +2166,31 @@ def signed_profit(value: int) -> str:
     return f"{ui(value):+.2f}" if abs(value) >= 10000 or value == 0 else f"{ui(value):+.6f}"
 
 
+def venue_links(row: dict) -> list[str]:
+    ticker = url_quote(row["asset"].removesuffix(".US"), safe="")
+    links = [f"Backpack: https://backpack.exchange/stocks/{ticker}"]
+    if row.get("mint"):
+        source, target = (row["mint"], USDC_MINT) if row["direction"] == FORWARD else (USDC_MINT, row["mint"])
+        links.append("Jupiter: https://jup.ag/swap?" + urlencode({"sell": source, "buy": target}))
+    return links
+
+
 def price_report(record: dict) -> list[str]:
     direction = price_direction(record)
     if record.get("dex_price") is None:
         reasons = [code for code in record.get("reasons", []) if code != "nonpositive_net"]
-        return [f"{direction}: нет актуального расчёта" + (" · " + block_text(reasons) if reasons else "")]
+        return [f"{direction}: нет актуального расчёта" + (" · " + block_text(reasons) if reasons else ""), *venue_links(record)]
     if not record["fresh"]:
         return [
             f"{direction}: котировка устарела · {record['quote_age_s']:.0f}с",
             f"Последний расчёт {quote_time(record['updated_at'], zone=False)}; прибыль сейчас не оценена.",
+            *venue_links(record),
         ]
     profit = record["profit_raw"]
     lines = [
         f"{direction}: {'ПРИБЫЛЬ В РАСЧЁТЕ' if profit > 0 else 'УБЫТОК' if profit < 0 else 'НУЛЕВОЙ РЕЗУЛЬТАТ'} "
         f"{signed_profit(profit)} USDC ({Decimal(profit) * 100 / record['cost_raw']:+.2f}%) с запасом slippage",
+        f"Объём: {amount(record['cost_raw'])} USDC",
     ]
     if record["direction"] == FORWARD:
         lines.extend(
@@ -2196,6 +2212,7 @@ def price_report(record: dict) -> list[str]:
         f"DEX {quote_time(record['dex_updated_at'], zone=False)} · {record['quote_age_s']:.0f}с"
     )
     lines.append(f"Комиссии учтены; gas {amount(record['gas_raw'])} USDC по модели.")
+    lines.extend(venue_links(record))
     return lines
 
 
@@ -2211,8 +2228,10 @@ def session_text(snapshot: dict) -> str | None:
 
 def compact_quote(row: dict) -> list[str]:
     lines = [
-        f"{row['asset']} {price_direction(row)}: оценка {signed_profit(row['profit_raw'])} USDC "
-        f"({dec(row['edge_bps']) / 100:.2f}%) после расходов и запаса slippage · {row['quote_age_s']:.0f}с",
+        f"{row['asset']} · {price_direction(row)}",
+        f"Чистый спред: {signed_profit(row['profit_raw'])} USDC ({dec(row['edge_bps']) / 100:+.2f}%) "
+        "после расходов и запаса slippage",
+        f"Объём: {amount(row['cost_raw'])} USDC",
     ]
     if "quoted_output_raw" in row:
         pair = price_pair(row)
@@ -2230,9 +2249,10 @@ def compact_quote(row: dict) -> list[str]:
         if row["direction"] == REVERSE:
             lines.append("Продажа после зачисления на BP; цена за время перевода может измениться.")
     else:
-        lines.append(f"Размер: {amount(row['cost_raw'])} USDC")
+        lines.append(f"Возраст котировки: {row['quote_age_s']:.0f}с")
     if not row.get("candidate") and row.get("candidate_blocks"):
         lines.append("Автоисполнение не разрешено: " + block_text(row["candidate_blocks"]))
+    lines.extend(venue_links(row))
     return lines
 
 
