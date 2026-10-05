@@ -341,6 +341,8 @@ class WalletWatcher:
                 "stock_decimals",
                 "withdrawal_fee_raw",
                 "gas_raw",
+                "deposit_gas_raw",
+                "backpack_deposit_required",
                 "price_impact_pct",
                 "backpack_session",
             )

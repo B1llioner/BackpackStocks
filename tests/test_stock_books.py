@@ -304,7 +304,63 @@ async def test_reverse_uses_bid_depth_for_actual_minimum_dex_output(monitor):
     fill = mon.books.fill("WEN.US", row["sellable_raw"], "Ask")
     assert row["proceeds_raw"] == fill.value_raw and row["backpack_source"] == "spot"
     assert mon.snapshot()["signal_candidates"] == 1
-    assert mon.backpack.max_order_quantity.call_args.args[1] == "Ask"
+    assert row["backpack_deposit_required"] and row["book_capacity_checked_at"] is None
+    mon.backpack.max_order_quantity.assert_not_awaited()
+    mon.backpack.order.assert_not_awaited()
+
+
+async def test_reverse_search_and_calls_are_independent_of_empty_backpack_inventory_and_usdc(monitor):
+    mon, clock = monitor
+    await setup_books(mon, clock)
+    close_rfq(mon, clock)
+    mon.settings.monitor.auto_size = True
+
+    def empty_limit(symbol, side, price):
+        return {**limit(symbol, side, price), "maxOrderQuantity": "0"}
+
+    mon.backpack.max_order_quantity.side_effect = empty_limit
+    assert await mon.quote(("WEN.US", FORWARD)) is None
+    mon.jupiter.quote_pair.assert_not_awaited()
+    assert mon.choose() == ("WEN.US", REVERSE)
+    assert mon.next_budget(("WEN.US", REVERSE)) == Decimal("100")
+    mon.backpack.max_order_quantity.reset_mock()
+    mon.jupiter.quote_pair.return_value = {"outAmount": "20000000", "priceImpact": "0.1", "gasless": True}
+    row = await mon.quote(("WEN.US", REVERSE))
+    assert row and row["gas_raw"] == row["deposit_gas_raw"] == 30_000
+    assert row["backpack_deposit_required"] and not row["trading_supported"]
+    snapshot = mon.snapshot()
+    assert snapshot["signal_candidates"] == 1 and snapshot["prices"][0]["direction"] == REVERSE
+    text = mon.prices_text(["WEN.US"])
+    assert "Jup → BP стакан: ПРИБЫЛЬ В РАСЧЁТЕ" in text
+    assert "Продажа после зачисления" in text and "gas 0.03 USDC" in text
+    mon.backpack.max_order_quantity.assert_not_awaited()
+    mon.backpack.order.assert_not_awaited()
+    mon.backpack.accept_rfq.assert_not_awaited()
+
+
+@pytest.mark.parametrize("invalidation", ["depth", "fee", "deposit", "minimum_deposit", "chain"])
+async def test_conditional_reverse_call_is_removed_when_any_required_data_becomes_invalid(monitor, invalidation):
+    from dataclasses import replace
+
+    mon, clock = monitor
+    await setup_books(mon, clock)
+    close_rfq(mon, clock)
+    mon.jupiter.quote_pair.return_value = {"outAmount": "20000000", "priceImpact": "0.1"}
+    assert await mon.quote(("WEN.US", REVERSE))
+    assert mon.snapshot()["signal_candidates"] == 1
+    if invalidation == "depth":
+        clock.now += mon.books.ttl
+    elif invalidation == "fee":
+        mon.books.fee_at = clock() - mon.books.fee_ttl
+    elif invalidation == "deposit":
+        mon.assets["WEN.US"] = replace(mon.assets["WEN.US"], deposit_enabled=False)
+    elif invalidation == "minimum_deposit":
+        mon.assets["WEN.US"] = replace(mon.assets["WEN.US"], deposit_min=Decimal("21"))
+    else:
+        mon.chain["WEN.US"] = "unsupported_mint_or_unit_mapping"
+    assert mon.snapshot()["signal_candidates"] == 0
+    assert not mon.snapshot()["prices"]
+    assert "ПРИБЫЛЬ В РАСЧЁТЕ" not in mon.prices_text(["WEN.US"])
     mon.backpack.order.assert_not_awaited()
 
 

@@ -232,12 +232,13 @@ def status_text(engine: Engine) -> str:
             f"Режим: {engine.settings.mode} · монитор {snapshot['universe']} акций\n"
             "Объём: автоподбор без потолка USDC\n"
             f"RFQ: {snapshot['rfq_available_assets']}/{snapshot['universe']}; "
-            f"стаканы: {snapshot.get('spot_available_assets', 0)}/{snapshot.get('spot_markets', 0)}; "
+            f"стаканы для расчёта: {snapshot.get('spot_supported_assets', 0)}/{snapshot.get('spot_markets', 0)}; "
             f"свежих котировок: {snapshot['fresh_quotes']}; "
             f"сигналов сейчас: {snapshot.get('signal_candidates', snapshot['candidates'])}\n"
             f"RFQ обновляется каждые {engine.settings.monitor.rfq_cache_s:g}с; "
             f"стаканы каждые {engine.settings.monitor.spot_refresh_s:g}с; "
             f"срок свежести {engine.settings.monitor.max_quote_age_s:g}с."
+            "\nПроверяются BP → Jupiter и Jupiter → BP. Обратная продажа требует зачисления акции на BP."
         )
         closed = session_text(snapshot)
         return text + ("\n" + closed if closed else "")
@@ -615,7 +616,17 @@ class TelegramController:
                     await self.reply("Акция не найдена в мониторе. /universe — доступные тикеры.")
                     return
                 symbols = [symbol] if symbol else sorted(monitor.assets)
-                groups = [symbols[i : i + 24] for i in range(0, len(symbols), 24)] or [[]]
+                # Both directions add variable amounts of detail. Pack by actual
+                # rendered size using one snapshot, then rerender on delivery.
+                snapshot = monitor.snapshot()
+                groups: list[list[str]] = []
+                group: list[str] = []
+                for item in symbols:
+                    if group and len(monitor.prices_text([*group, item], page=999, total=999, snapshot=snapshot)) > 3700:
+                        groups.append(group)
+                        group = []
+                    group.append(item)
+                groups.append(group)
                 for index, group in enumerate(groups, 1):
                     render = partial(monitor.prices_text, group, page=index, total=len(groups))
                     await self.reply(render(), render=render)

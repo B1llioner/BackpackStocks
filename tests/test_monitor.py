@@ -271,7 +271,8 @@ async def test_reverse_uses_exact_usdc_notional_and_conservative_stock_sale(moni
     await mon.quote(("WEN.US", REVERSE))
     mon.jupiter.quote_pair.assert_awaited_once_with(USDC_MINT, STOCK_MINT, 100000000, priority=10)
     row = mon.snapshot(include_hidden=True)["rows"][0]
-    assert row["profit_raw"] == -4340850
+    assert row["profit_raw"] == -4370850
+    assert row["gas_raw"] == 60_000 and row["deposit_gas_raw"] == 30_000
     assert not any("profit_raw" in r for r in mon.snapshot()["rows"])
     assert not row["candidate"] and not row["trading_supported"]
 
@@ -406,6 +407,22 @@ def test_first_forward_pass_is_not_starved_by_repeated_point_price_leader(monito
     mon.attempted[("WEN.US", FORWARD)] = clock() - 10
     mon.estimate = lambda a, direction=None: Decimal("1000") if a.symbol == "WEN.US" else None
     assert mon.choose() == ("COLD.US", FORWARD)
+
+
+def test_first_pass_checks_reverse_without_waiting_for_all_forward_assets(monitor):
+    mon, clock = monitor
+    for index in range(68):
+        item = asset(f"S{index:02d}.US", USDC_MINT)
+        mon.assets[item.symbol] = item
+        mon.chain[item.symbol] = "verified_unit_mapping"
+        mon.backpack.stock_feed.latest[item.ticker] = observed(clock)
+    directions = []
+    for _ in range(4):
+        key = mon.choose()
+        assert key is not None
+        directions.append(key[1])
+        mon.attempted[key] = clock()
+    assert directions == [FORWARD, REVERSE, FORWARD, REVERSE]
 
 
 def test_without_projected_positive_spread_scheduler_uses_oldest_on_every_slot(monitor):

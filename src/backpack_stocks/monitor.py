@@ -65,6 +65,7 @@ BLOCK_LABELS = {
     "rfq_expired_before_check": "RFQ истекла до проверки",
     "rfq_check_stale": "проверка RFQ устарела",
     "rfq_check_pending": "доступность покупки RFQ ещё не проверена",
+    "rfq_sell_check_pending": "доступность продажи RFQ ещё не проверена",
     "rfq_budget_changed": "RFQ не укладывается в бюджет",
     "budget_below_minimum_lot": "минимальный лот дороже лимита",
     "below_withdrawal_minimum": "объём ниже минимума вывода",
@@ -413,24 +414,24 @@ class SpreadMonitor:
             raise ValueError("Below withdrawal minimum after fee")
         return acquired, acquired - fee
 
-    def rfq_observation(self, asset: Asset) -> Observation:
+    def rfq_observation(self, asset: Asset, direction: str = FORWARD) -> Observation:
         obs = self.observation(asset)
-        check = self.rfq.latest.get((asset.symbol, "Bid"))
+        check = self.rfq.latest.get((asset.symbol, "Bid" if direction == FORWARD else "Ask"))
         if (
             check
             and check.price
             and check.session == self.quantity_session(obs)
             and check.eligible(self.clock())
         ):
-            obs = obs.model_copy(update={"ask": check.price})
+            obs = obs.model_copy(update={"ask" if direction == FORWARD else "bid": check.price})
         return obs
 
     def planning_observation(self, asset: Asset, direction: str = FORWARD) -> Observation:
         spot = self.books.observation(asset.symbol) if self.books.available(asset.symbol) else None
         try:
-            obs = self.rfq_observation(asset)
+            obs = self.rfq_observation(asset, direction)
             session = self.quantity_session(obs)
-            if spot and self.settings.monitor.rfq_validation and not self.rfq_ready(asset, session):
+            if spot and self.settings.monitor.rfq_validation and not self.rfq_ready(asset, session, direction):
                 return spot
         except (ValueError, KeyError, TypeError):
             if spot:
@@ -494,12 +495,32 @@ class SpreadMonitor:
             )
         )
 
-    def budget(self, asset: Asset, obs: Observation, notional: Decimal | None = None) -> Decimal:
+    def size_bounds(self, asset: Asset, obs: Observation, direction: str) -> tuple[Decimal, Decimal]:
+        if direction == FORWARD:
+            return self.size_floor(asset, obs), self.size_ceiling(asset, obs)
+        rules = self.quantity_rules(asset, obs)
+        step = dec(rules["stepSize"])
+        minimum = max(dec(rules["minQuantity"]), asset.deposit_min)
+        minimum = (minimum / step).to_integral_value(rounding=ROUND_CEILING) * step
+        maximum = dec(rules["maxQuantity"])
+        if obs.session == SPOT_SESSION:
+            maximum = min(maximum, self.books.quantity_ceiling(asset.symbol, "Ask"))
+        maximum = floor_step(maximum, step)
+        if maximum < minimum:
+            raise ValueError("Reverse sale below minimum deposit or lot")
+        # Planning bounds only. The subsequent DEX quote and exact sale validate
+        # the acquired quantity; the BP USDC buy balance does not bound this side.
+        return minimum * dec(obs.bid), maximum * dec(obs.bid)
+
+    def budget(
+        self, asset: Asset, obs: Observation, notional: Decimal | None = None, *, direction: str = FORWARD
+    ) -> Decimal:
         initial = dec(self.settings.monitor.notional_usdc)
         if self.settings.monitor.auto_size:
+            minimum, maximum = self.size_bounds(asset, obs, direction)
             chosen = min(
-                self.size_ceiling(asset, obs),
-                max(self.size_floor(asset, obs), initial if notional is None else notional),
+                maximum,
+                max(minimum, initial if notional is None else notional),
             )
         else:
             cap = min(initial, dec(self.settings.policy.max_cost_usdc))
@@ -509,13 +530,14 @@ class SpreadMonitor:
     def next_budget(self, key: tuple[str, str]) -> Decimal:
         asset = self.assets[key[0]]
         obs = self.planning_observation(asset, key[1])
+        minimum, maximum = self.size_bounds(asset, obs, key[1])
         return self.volume_search.next(
             key,
-            self.budget(asset, obs),
+            self.budget(asset, obs, direction=key[1]),
             self.clock(),
             auto_size=self.settings.monitor.auto_size,
-            minimum=self.size_floor(asset, obs),
-            maximum=self.size_ceiling(asset, obs),
+            minimum=minimum,
+            maximum=maximum,
         )
 
     def budget_info(self, symbol: str) -> dict:
@@ -578,33 +600,32 @@ class SpreadMonitor:
         for asset in self.assets.values():
             if self.chain.get(asset.symbol) != "verified_unit_mapping":
                 continue
-            try:
-                observation = self.planning_observation(asset)
-                session = self.quantity_session(observation)
-            except (ValueError, KeyError, TypeError):
-                continue
             size_probe = (
                 self.settings.monitor.auto_size or (asset.symbol, FORWARD) in self.optimization_requested
             ) and self.size_refusal(asset)
             spot = self.books.available(asset.symbol)
-            if (
-                config.rfq_validation
-                and not spot
-                and self.rfq.blocked(asset.symbol, session)
-                and not size_probe
-            ):
-                continue
-            if config.rfq_validation and not spot and not self.rfq_ready(asset, session) and not size_probe:
-                continue
             for direction in (FORWARD, REVERSE):
                 key = (asset.symbol, direction)
                 if key in self.pending or (direction == REVERSE and not asset.deposit_enabled):
                     continue
+                try:
+                    observation = self.planning_observation(asset, direction)
+                    session = self.quantity_session(observation)
+                except (ValueError, KeyError, TypeError):
+                    continue
                 if (
                     config.rfq_validation
                     and not spot
-                    and direction == REVERSE
-                    and self.rfq.blocked(asset.symbol, session, "Ask")
+                    and self.rfq.blocked(asset.symbol, session, "Bid" if direction == FORWARD else "Ask")
+                    and not (direction == FORWARD and size_probe)
+                ):
+                    continue
+                if (
+                    direction == FORWARD
+                    and config.rfq_validation
+                    and not spot
+                    and not self.rfq_ready(asset, session)
+                    and not size_probe
                 ):
                     continue
                 last = self.attempted.get(key, 0)
@@ -654,16 +675,19 @@ class SpreadMonitor:
             return selected[2], selected[3]
         self._sequence += 1
         overdue = [row for row in available if now - row[0] >= config.exploration_s]
-        unseen_forward = [row for row in available if row[0] == 0 and row[3] == FORWARD]
+        unseen = [row for row in available if row[0] == 0]
         fresh_positive = any(
             row.get("profit_raw", 0) > 0 and 0 <= now - row["dex_observed_at"] <= config.max_quote_age_s
             for row in self.results.values()
         )
         hot_available = [row for row in available if row[1] < 0]
-        if unseen_forward and not fresh_positive:
-            # Finish the first buy/sell price pass before repeatedly probing a
-            # few misleading point-price leaders or unfunded reverse legs.
-            selected = min(unseen_forward, key=lambda row: (row[1], row[2]))
+        if unseen and not fresh_positive:
+            # Alternate sides during discovery; neither direction waits for an
+            # entire universe pass, and stale point-price leaders cannot starve it.
+            side = FORWARD if self._sequence % 2 else REVERSE
+            selected = min(
+                [row for row in unseen if row[3] == side] or unseen, key=lambda row: (row[1], row[2])
+            )
         elif self._sequence % 4 == 0 or not hot_available:
             selected = min(overdue or available)
         else:
@@ -711,13 +735,13 @@ class SpreadMonitor:
             session = self.quantity_session(self.observation(asset))
         except (ValueError, KeyError, TypeError):
             return True
-        buy_block = self.rfq.blocked(asset.symbol, session)
-        if self.settings.monitor.auto_size and buy_block and buy_block.reason in SIZE_REFUSALS:
-            buy_block = None
-        return bool(buy_block or (direction == REVERSE and self.rfq.blocked(asset.symbol, session, "Ask")))
+        block = self.rfq.blocked(asset.symbol, session, "Bid" if direction == FORWARD else "Ask")
+        if direction == FORWARD and self.settings.monitor.auto_size and block and block.reason in SIZE_REFUSALS:
+            block = None
+        return bool(block)
 
-    def rfq_ready(self, asset: Asset, session: str) -> bool:
-        check = self.rfq.latest.get((asset.symbol, "Bid"))
+    def rfq_ready(self, asset: Asset, session: str, direction: str = FORWARD) -> bool:
+        check = self.rfq.latest.get((asset.symbol, "Bid" if direction == FORWARD else "Ask"))
         return bool(check and check.session == session and check.eligible(self.clock()))
 
     def size_refusal(self, asset: Asset) -> bool:
@@ -846,12 +870,13 @@ class SpreadMonitor:
                 obs = self.books.observation(asset.symbol)
                 sellable = self.sale_quantity(asset, obs, output)
                 fill = self.books.fill(asset.symbol, sellable, "Ask")
-                await self.books.check_capacity(asset.symbol, fill)
+                # This route buys stock on-chain before depositing it. Current
+                # BP inventory cannot validate (or disqualify) that future sale.
                 candidates.append((sellable, obs, None, fill, fill.value_raw))
             except Exception as error:
                 failures.append(error)
         try:
-            obs = self.rfq_observation(asset)
+            obs = self.rfq_observation(asset, REVERSE)
             sellable = self.sale_quantity(asset, obs, output)
             check = None
             if self.settings.monitor.rfq_validation:
@@ -873,7 +898,7 @@ class SpreadMonitor:
         return max(candidates, key=lambda c: c[4])
 
     def book_fields(self, asset: Asset, fill: BookFill) -> dict:
-        capacity = self.books.capacities[(asset.symbol, fill.side)]
+        capacity = self.books.capacities[(asset.symbol, "Bid")] if fill.side == "Bid" else None
         return {
             "backpack_source": "spot",
             "backpack_market": fill.market,
@@ -886,10 +911,11 @@ class SpreadMonitor:
             "backpack_model": False,
             "backpack_valid_until": min(
                 fill.timestamp + self.books.ttl,
-                capacity.checked_at + self.books.ttl,
+                capacity.checked_at + self.books.ttl if capacity else float("inf"),
                 self.books.fee_at + self.books.fee_ttl,
             ),
-            "book_capacity_checked_at": capacity.checked_at,
+            "book_capacity_checked_at": capacity.checked_at if capacity else None,
+            "backpack_deposit_required": fill.side == "Ask",
             "book_update_id": fill.update_id,
             "book_levels": fill.levels,
             "book_gross_raw": fill.gross_raw,
@@ -905,8 +931,10 @@ class SpreadMonitor:
         fill = self.books.fill(
             asset.symbol, row["acquired_raw"] if buy else row["sellable_raw"], "Bid" if buy else "Ask"
         )
-        if self.books.markets[asset.symbol].symbol != row["backpack_market"] or not self.books.capacity_valid(
-            asset.symbol, fill, row["book_capacity_checked_at"]
+        if not buy and (not asset.deposit_enabled or ui(row["minimum_output_raw"], asset.decimals) < asset.deposit_min):
+            raise ValueError("Reverse deposit unavailable")
+        if self.books.markets[asset.symbol].symbol != row["backpack_market"] or (
+            buy and not self.books.capacity_valid(asset.symbol, fill, row["book_capacity_checked_at"])
         ):
             raise BookUnavailable("spot_capacity_stale")
         return fill
@@ -964,7 +992,7 @@ class SpreadMonitor:
             asset = self.assets[symbol]
             obs = self.planning_observation(asset, direction)
             p = self.settings.policy
-            budget = self.budget(asset, obs, notional)
+            budget = self.budget(asset, obs, notional, direction=direction)
             if budget <= 0:
                 raise ValueError("Invalid size budget")
             if direction == FORWARD:
@@ -988,10 +1016,6 @@ class SpreadMonitor:
                 source, target, input_raw = USDC_MINT, asset.mint, raw(budget)
                 acquired = delivered = 0
                 if not self.books.available(symbol):
-                    if self.settings.monitor.rfq_validation and not self.rfq_ready(
-                        asset, self.quantity_session(obs)
-                    ):
-                        _, _, obs, rfq_check = await self.validated_buy(asset, obs, notional=budget)
                     previous = self.rfq.latest.get((symbol, "Ask"))
                     if (
                         self.settings.monitor.rfq_validation
@@ -1019,6 +1043,8 @@ class SpreadMonitor:
             output = min(reserved_output, provider_minimum)
             gasless = quote.get("gasless") is True
             gas = 0 if gasless else raw(p.gas_budget_usdc)
+            deposit_gas = raw(p.gas_budget_usdc) if direction == REVERSE else 0
+            gas += deposit_gas
             if direction == FORWARD:
                 if book_fill:
                     # Revalue the same stock quantity after the DEX network wait.
@@ -1057,6 +1083,8 @@ class SpreadMonitor:
                 "stock_decimals": asset.decimals,
                 "withdrawal_fee_raw": raw(asset.fee, asset.decimals) if direction == FORWARD else 0,
                 "gas_raw": gas,
+                "deposit_gas_raw": deposit_gas,
+                "backpack_deposit_required": direction == REVERSE,
                 "gas_source": "included_in_dex_quote" if gasless else "model",
                 "slippage_bps": max(p.slippage_bps, int(quote.get("slippageBps") or 0)),
                 "policy_slippage_bps": p.slippage_bps,
@@ -1412,6 +1440,24 @@ class SpreadMonitor:
                 if not rfq_eligible and rfq_status[-1]["state"] == "available":
                     rfq_status[-1].update(state="unknown", reason=rfq_reason)
             for direction in (FORWARD, REVERSE):
+                side_eligible, side_reason = rfq_eligible, rfq_reason
+                if direction == REVERSE and config.rfq_validation:
+                    sell_check = self.rfq.latest.get((asset.symbol, "Ask"))
+                    side_eligible = False
+                    side_reason = "rfq_sell_check_pending"
+                    try:
+                        session = self.quantity_session(self.observation(asset))
+                        side_eligible = bool(
+                            sell_check and sell_check.session == session and sell_check.eligible(now)
+                        )
+                        if sell_check:
+                            side_reason = (
+                                sell_check.reason if now < sell_check.eligibility_until else "rfq_check_stale"
+                            )
+                            if sell_check.session != session:
+                                side_reason = "rfq_session_unavailable"
+                    except (ValueError, KeyError, TypeError):
+                        side_reason = "rfq_session_unavailable"
                 key = asset.symbol, direction
                 result = self.results.get(key)
                 row = dict(
@@ -1425,6 +1471,7 @@ class SpreadMonitor:
                     and 0 <= age <= config.max_quote_age_s
                     and metadata_fresh
                     and self.chain.get(asset.symbol) == "verified_unit_mapping"
+                    and (direction == FORWARD or asset.deposit_enabled)
                 )
                 if result and fresh:
                     try:
@@ -1557,7 +1604,7 @@ class SpreadMonitor:
                 )
                 positive = not result or row.get("profit_raw", 0) > 0
                 spot_result = row.get("backpack_source") == "spot"
-                source_eligible = self.books.available(asset.symbol) if spot_result else rfq_eligible
+                source_eligible = self.books.available(asset.symbol) if spot_result else side_eligible
                 fresh_calculations += bool(result and fresh and source_eligible)
                 direction_eligible = source_eligible and (
                     not config.rfq_validation
@@ -1577,7 +1624,7 @@ class SpreadMonitor:
                         for code in row["candidate_blocks"]
                     )
                 )
-                if (rfq_eligible or self.books.available(asset.symbol)) and screen is not None:
+                if (side_eligible or self.books.available(asset.symbol)) and screen is not None:
                     screened_assets.add(asset.symbol)
                 if direction_eligible and result and fresh:
                     # Price availability is independent of profitability. Publish
@@ -1595,8 +1642,8 @@ class SpreadMonitor:
                             "retry_in_s": max(0, self.retry_after.get(key, 0) - now),
                             "reasons": [self.chain.get(asset.symbol, "unverified")]
                             if self.chain.get(asset.symbol) != "verified_unit_mapping"
-                            else [rfq_reason]
-                            if not rfq_eligible and not self.books.available(asset.symbol)
+                            else [side_reason]
+                            if not side_eligible and not self.books.available(asset.symbol)
                             else ["nonpositive_net"]
                             if not positive
                             else row["error_causes"] or row["candidate_blocks"],
@@ -1644,6 +1691,26 @@ class SpreadMonitor:
                     backpack_fresh=check.usable(now) and status["state"] == "available",
                     buy_quantity=check.quantity,
                 )
+            reverse = dict(self.price_history.get((symbol, REVERSE), {}))
+            current_reverse = next(
+                (pair for pair in prices if pair["asset"] == symbol and pair["direction"] == REVERSE), None
+            )
+            if current_reverse:
+                reverse.update(current_reverse)
+            reverse.update(asset=symbol, direction=REVERSE, fresh=(symbol, REVERSE) in fresh_keys)
+            if reverse.get("updated_at") is not None:
+                reverse["quote_age_s"] = max(0, now - reverse["updated_at"])
+            reverse["reasons"] = next(
+                (d["reasons"] for d in diagnostics if d["asset"] == symbol and d["direction"] == REVERSE), []
+            )
+            sell_check = self.rfq.latest.get((symbol, "Ask"))
+            reverse["rfq_state"] = sell_check.public(now)["state"] if sell_check else "unknown"
+            if "rfq_session_unavailable" in reverse["reasons"]:
+                reverse["rfq_state"] = "unavailable"
+            record["reverse"] = reverse
+            record["reasons"] = next(
+                (d["reasons"] for d in diagnostics if d["asset"] == symbol and d["direction"] == FORWARD), []
+            )
             catalog.append(record)
         repeat_intervals = sorted(self.price_repeat_intervals)
         latency = sorted(self.latencies)
@@ -1720,6 +1787,12 @@ class SpreadMonitor:
             ],
             "spot_markets": len(self.books.markets),
             "spot_available_assets": sum(self.books.available(symbol) for symbol in self.books.markets),
+            "spot_supported_assets": sum(
+                self.books.available(symbol)
+                and self.chain.get(symbol) == "verified_unit_mapping"
+                and 0 <= now - self.metadata_at <= config.metadata_s * 2
+                for symbol in self.books.markets
+            ),
             "spot_refresh_s": config.spot_refresh_s,
             "rfq_available_assets": sum(r["state"] == "available" for r in rfq_status),
             "rfq_unavailable_assets": sum(r["state"] == "unavailable" for r in rfq_status),
@@ -1924,41 +1997,29 @@ class SpreadMonitor:
             if selected(r) and r["fresh"] and r.get("signal_eligible") is False and r.get("profit_raw", 0) > 0
         ]
         prices = [r for r in snapshot.get("prices", []) if selected(r)]
-        size = (
-            "автоподбор объёма без потолка USDC"
-            if self.settings.monitor.auto_size
-            else f"объём до {self.settings.monitor.notional_usdc} USDC"
-        )
-        lines = [f"Котировки: {len(prices)} свежих · {size}"]
-        if snapshot.get("spot_markets"):
-            lines[0] += f" · стаканы {snapshot['spot_available_assets']}/{snapshot['spot_markets']}"
-        if snapshot.get("rfq_validation"):
-            lines[0] += f" · RFQ {snapshot['rfq_available_assets']}/{snapshot['universe']}"
-        if snapshot.get("last_quote_at"):
-            lines.append(f"Последнее обновление: {quote_time(snapshot['last_quote_at'])}")
-        session_message = session_text(snapshot)
-        if session_message:
-            lines.append(session_message)
+        lines = []
         if rows:
+            lines.append(f"Положительных расчётов после расходов: {len(rows)}")
             for row in rows:
                 lines.extend(["", *compact_quote(row)])
         else:
-            if snapshot.get("rfq_session_state") != "closed" or snapshot.get("spot_available_assets"):
-                lines.append(
-                    "Свежие расчёты не прошли проверки."
-                    if rejected
-                    else "Положительных спредов после расходов нет."
-                    if prices
-                    else "Свежих полных котировок пока нет."
-                )
+            lines.append(
+                "Положительный расчёт не прошёл проверки."
+                if rejected
+                else f"В {len(prices)} актуальных расчётах прибыли нет."
+                if prices
+                else "Свежих полных котировок пока нет. Прибыль не оценена."
+            )
             for row in rejected[:5]:
                 lines.append(f"{row['asset']}: {block_text(row['candidate_blocks'])}")
-            for pair in prices[:5]:
-                lines.append(
-                    f"{pair['asset']} {price_direction(pair)}: BP {pair['backpack_price']} / "
-                    f"{dex_label(pair)} {pair['dex_price']} · {pair['quote_age_s']:.0f}с"
-                )
-            if symbol and not prices and snapshot.get("rfq_session_state") != "closed":
+            if prices:
+                lines.append(f"Обновлено {quote_time(max(pair['updated_at'] for pair in prices))}")
+                lines.append("Объёмы, результат и оба направления: /prices" + (f" {symbol}" if symbol else ""))
+            else:
+                session_message = session_text(snapshot)
+                if session_message:
+                    lines.append(session_message)
+            if symbol and not prices:
                 reasons = sorted(
                     {
                         code
@@ -1975,10 +2036,15 @@ class SpreadMonitor:
                 )
                 if retry > 0:
                     lines.append(f"Повтор запроса {symbol} через {retry:.0f}с.")
+        for direction, label in ((FORWARD, "BP → Jup"), (REVERSE, "Jup → BP")):
+            tickers = sorted({r["asset"] for r in prices if r["direction"] == direction})
+            lines.append(f"Акции {label}: {', '.join(tickers) if tickers else 'нет свежих расчётов'}.")
         return "\n".join(lines)
 
-    def prices_text(self, symbols: list[str] | None = None, *, page: int = 1, total: int = 1) -> str:
-        snapshot = self.snapshot()
+    def prices_text(
+        self, symbols: list[str] | None = None, *, page: int = 1, total: int = 1, snapshot: dict | None = None
+    ) -> str:
+        snapshot = self.snapshot() if snapshot is None else snapshot
         selected = sorted(self.assets) if symbols is None else symbols
         catalog = {r["asset"]: r for r in snapshot["price_catalog"]}
         interval = snapshot["price_repeat_median_s"]
@@ -2005,35 +2071,22 @@ class SpreadMonitor:
                 record["rfq_state"]
             ]
             book = (
-                " · стакан " + ("доступен" if record["spot_available"] else "нет цены")
+                " · стакан "
+                + (
+                    "доступен"
+                    if record["spot_available"] and record["chain"] == "verified_unit_mapping"
+                    else "не пригоден для расчёта"
+                )
                 if record.get("spot_market")
                 else ""
             )
-            lines.append(f"\n{symbol} · RFQ {rfq}{book}")
-            bp_label = "BP стакан" if record.get("backpack_source") == "spot" else "BP RFQ"
-            if record.get("dex_price") is not None:
-                flag = "" if record["fresh"] else " · устарела"
-                lines.append(
-                    f"{bp_label} {record['backpack_price']} / {dex_label(record)} {record['dex_price']} USDC/шт{flag}"
-                )
-                lines.append(
-                    f"{record['buy_quantity']} шт за {amount(record['cost_raw'])} → "
-                    f"{amount(record['quoted_output_raw'])} USDC (мин {amount(record['minimum_output_raw'])})"
-                )
-                lines.append(
-                    f"BP {quote_time(record['backpack_updated_at'], zone=False)} / "
-                    f"DEX {quote_time(record['dex_updated_at'], zone=False)} · {record['quote_age_s']:.0f}с"
-                )
-            elif record.get("backpack_price") is not None:
-                flag = "" if record["backpack_fresh"] else " · устарела"
-                lines.append(f"{bp_label} {record['backpack_price']} USDC/шт{flag}; DEX нет котировки")
-                lines.append(
-                    f"{bp_label} {record['buy_quantity']} шт · "
-                    f"обновлена {quote_time(record['backpack_updated_at'], zone=False)}"
-                )
-            else:
-                lines.append("BP / DEX: котировки нет")
-            if record["rfq_state"] != "available":
+            sell_rfq = {"available": "доступна", "unavailable": "нет", "unknown": "непроверена"}[
+                record["reverse"]["rfq_state"]
+            ]
+            lines.append(f"\n{symbol} · RFQ покупка {rfq}, продажа {sell_rfq}{book}")
+            lines.extend(price_report({**record, "direction": FORWARD}))
+            lines.extend(price_report(record["reverse"]))
+            if record["rfq_state"] != "available" and not record["spot_available"]:
                 lines.append(block_text([record["rfq_reason"]]))
             if record["chain"] != "verified_unit_mapping":
                 lines.append(block_text([record["chain"]]))
@@ -2082,11 +2135,68 @@ def price_pair(row: dict) -> dict:
         "dex_updated_at": dex_at,
         "updated_at": min(bp_at, dex_at),
         "quote_age_s": max(0, row.get("quote_age_s", 0), row.get("observed_at", dex_at) - min(bp_at, dex_at)),
-        "buy_quantity": amount(row["acquired_raw"], decimals),
+        "buy_quantity": amount(
+            row["acquired_raw"] if row["direction"] == FORWARD else row["minimum_output_raw"], decimals
+        ),
+        "sell_quantity": amount(
+            row["delivered_raw"] if row["direction"] == FORWARD else row["sellable_raw"], decimals
+        ),
         "cost_raw": row["cost_raw"],
         "quoted_output_raw": row["quoted_output_raw"],
         "minimum_output_raw": row["minimum_output_raw"],
+        "proceeds_raw": row["proceeds_raw"],
+        "profit_raw": row["profit_raw"],
+        "quoted_profit_raw": row["quoted_output_raw"] - row["cost_raw"] - row["gas_raw"]
+        if row["direction"] == FORWARD
+        else None,
+        "gas_raw": row["gas_raw"],
+        "deposit_gas_raw": row.get("deposit_gas_raw", 0),
+        "backpack_deposit_required": row.get("backpack_deposit_required", row["direction"] == REVERSE),
+        "candidate_blocks": row.get("candidate_blocks", []),
+        "stock_decimals": decimals,
     }
+
+
+def signed_profit(value: int) -> str:
+    return f"{ui(value):+.2f}" if abs(value) >= 10000 or value == 0 else f"{ui(value):+.6f}"
+
+
+def price_report(record: dict) -> list[str]:
+    direction = price_direction(record)
+    if record.get("dex_price") is None:
+        reasons = [code for code in record.get("reasons", []) if code != "nonpositive_net"]
+        return [f"{direction}: нет актуального расчёта" + (" · " + block_text(reasons) if reasons else "")]
+    if not record["fresh"]:
+        return [
+            f"{direction}: котировка устарела · {record['quote_age_s']:.0f}с",
+            f"Последний расчёт {quote_time(record['updated_at'], zone=False)}; прибыль сейчас не оценена.",
+        ]
+    profit = record["profit_raw"]
+    lines = [
+        f"{direction}: {'ПРИБЫЛЬ В РАСЧЁТЕ' if profit > 0 else 'УБЫТОК' if profit < 0 else 'НУЛЕВОЙ РЕЗУЛЬТАТ'} "
+        f"{signed_profit(profit)} USDC ({Decimal(profit) * 100 / record['cost_raw']:+.2f}%) с запасом slippage",
+    ]
+    if record["direction"] == FORWARD:
+        lines.extend(
+            [
+                f"{record['buy_quantity']} шт за {amount(record['cost_raw'])} → {amount(record['quoted_output_raw'])} USDC "
+                f"(мин {amount(record['proceeds_raw'])})",
+                f"По quote: {signed_profit(record['quoted_profit_raw'])} USDC после расходов",
+            ]
+        )
+    else:
+        lines.append(
+            f"{amount(record['cost_raw'])} USDC → мин {record['buy_quantity']} шт; "
+            f"продать {record['sell_quantity']} шт за {amount(record['proceeds_raw'])} USDC"
+        )
+        lines.append("Продажа после зачисления на BP; цена за время перевода может измениться.")
+    lines.append(
+        f"BP {record['backpack_price']} / {dex_label(record)} {record['dex_price']} USDC/шт · "
+        f"BP {quote_time(record['backpack_updated_at'], zone=False)} / "
+        f"DEX {quote_time(record['dex_updated_at'], zone=False)} · {record['quote_age_s']:.0f}с"
+    )
+    lines.append(f"Комиссии учтены; gas {amount(record['gas_raw'])} USDC по модели.")
+    return lines
 
 
 def session_text(snapshot: dict) -> str | None:
@@ -2096,19 +2206,16 @@ def session_text(snapshot: dict) -> str | None:
     if snapshot.get("rfq_next_open_at") is not None:
         opening = datetime.fromtimestamp(snapshot["rfq_next_open_at"], ZoneInfo("Europe/Moscow"))
         text += f" Следующее открытие: {opening:%d.%m %H:%M} МСК."
-    if snapshot.get("spot_markets"):
-        text += f" Стаканы: {snapshot['spot_available_assets']}/{snapshot['spot_markets']} доступны."
     return text
 
 
 def compact_quote(row: dict) -> list[str]:
     lines = [
-        f"{row['asset']} {price_direction(row)}: +{amount(row['profit_raw'])} USDC "
-        f"({dec(row['edge_bps']) / 100:.2f}%) · {row['quote_age_s']:.0f}с",
+        f"{row['asset']} {price_direction(row)}: оценка {signed_profit(row['profit_raw'])} USDC "
+        f"({dec(row['edge_bps']) / 100:.2f}%) после расходов и запаса slippage · {row['quote_age_s']:.0f}с",
     ]
     if "quoted_output_raw" in row:
         pair = price_pair(row)
-        lines.append(f"BP {pair['backpack_price']} / {dex_label(pair)} {pair['dex_price']} USDC/шт")
         if row["direction"] == FORWARD:
             lines.append(
                 f"{pair['buy_quantity']} шт за {amount(row['cost_raw'])} → "
@@ -2120,6 +2227,8 @@ def compact_quote(row: dict) -> list[str]:
                 f"→ {amount(row['proceeds_raw'])} USDC"
             )
         lines.append(f"Обновлено {quote_time(pair['updated_at'])}")
+        if row["direction"] == REVERSE:
+            lines.append("Продажа после зачисления на BP; цена за время перевода может измениться.")
     else:
         lines.append(f"Размер: {amount(row['cost_raw'])} USDC")
     if not row.get("candidate") and row.get("candidate_blocks"):
@@ -2207,6 +2316,10 @@ def quote_details(row: dict) -> list[str]:
     gas_text = (
         "gasless уже включён" if row.get("dex_gasless") else f"gas {amount(row['gas_raw'])} USDC (модель)"
     )
+    if row.get("dex_gasless") and row.get("deposit_gas_raw"):
+        gas_text += f"; перевод в BP {amount(row['deposit_gas_raw'])} USDC (модель)"
+    if row.get("backpack_deposit_required"):
+        lines.append("Продажа после зачисления на BP; цена за время перевода может измениться.")
     lines.append(
         f"{bp_label} {price_pair(row)['backpack_price']} USDC/акция; сессия {row['backpack_session'].removeprefix('US_EQUITIES_')}; "
         f"fee {dec(str(row['backpack_fee_bps'])) / 100:g}%; slippage {row['slippage_bps'] / 100:g}%; "

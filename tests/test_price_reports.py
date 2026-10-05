@@ -5,7 +5,7 @@ from test_monitor import asset
 from test_rfq_validation import monitored, observed
 
 from backpack_stocks.jupiter_replay import JupiterReplay, ReplayError
-from backpack_stocks.monitor import FORWARD
+from backpack_stocks.monitor import FORWARD, REVERSE
 from backpack_stocks.rejection import api_error_metadata
 from backpack_stocks.telegram import TelegramAPI
 from backpack_stocks.transport import RemoteError
@@ -24,8 +24,10 @@ async def test_negative_spread_keeps_fresh_price_count_and_hides_negative_profit
     assert snapshot["fresh_quotes"] == snapshot["fresh_calculations"] == 1
     assert snapshot["prices"][0]["quote_age_s"] == 3
     assert snapshot["prices"][0]["backpack_price"] == "6.2"
-    assert "profit_raw" not in snapshot["prices"][0] and "edge_bps" not in snapshot["prices"][0]
-    assert "1 свежих" in mon.text() and "BP 6.2 / Jup" in mon.text()
+    assert snapshot["prices"][0]["profit_raw"] < 0
+    assert "В 1 актуальных расчётах прибыли нет" in mon.text()
+    assert "BP 6.2 / Jup" not in mon.text()
+    assert "УБЫТОК" in mon.prices_text(["WEN.US"])
     assert "net -" not in mon.text() and "Pool spot" not in mon.text()
 
 
@@ -40,7 +42,8 @@ async def test_expired_and_failed_prices_are_display_only_with_timestamp():
     catalog = snapshot["price_catalog"][0]
     assert not catalog["fresh"] and catalog["quote_age_s"] == 9
     text = mon.prices_text()
-    assert "устарела" in text and "BP 05:46:40 / DEX 05:46:40" in text
+    assert "устарела" in text and "Последний расчёт 05:46:40" in text
+    assert "ПРИБЫЛЬ В РАСЧЁТЕ" not in text and "прибыль сейчас не оценена" in text
     assert "RFQ каждые 60с" in text and "до 8с" in text
     mon.jupiter.quote_pair.side_effect = ReplayError("fixture", code="jupiter_transport_error")
     await mon.quote(("WEN.US", FORWARD))
@@ -60,14 +63,14 @@ async def test_all_stock_pages_preserve_every_ticker_and_rerender_expiry(bot):
     controller.engine.monitor = mon
     await controller.deliver_command("prices")
     items = [controller.outbox.get_nowait() for _ in range(controller.outbox.qsize())]
-    assert len(items) == 3
+    assert 1 < len(items) < len(mon.assets)
     rendered = "\n".join(item[2] for item in items)
     assert all(symbol in rendered for symbol in mon.assets)
     assert all(len(item[2]) <= 3900 for item in items)
     clock.now += 9
     mon.backpack.stock_feed.latest["WEN"] = observed(clock)
     rerendered = "\n".join(item[4]() for item in items)
-    assert "устарела" in rerendered and "RFQ доступна" in rerendered
+    assert "устарела" in rerendered and "RFQ покупка доступна" in rerendered
     assert "S66.US" in rerendered and not server.replies()
 
 
@@ -77,6 +80,46 @@ async def test_price_catalog_marks_session_change_unconfirmed():
     mon.backpack.stock_feed.latest["WEN"] = observed(clock).model_copy(update={"session": "PRE_MARKET"})
     catalog = mon.snapshot()["price_catalog"][0]
     assert catalog["rfq_state"] == "unknown" and not catalog["fresh"]
+
+
+async def test_positive_quote_before_slippage_is_not_presented_as_a_profitable_call():
+    mon, _ = monitored()
+    mon.jupiter.quote_pair.return_value = {"outAmount": "100200000", "priceImpact": "0.1"}
+    row = await mon.quote(("WEN.US", FORWARD))
+    assert row and row["quoted_output_raw"] - row["cost_raw"] - row["gas_raw"] > 0
+    assert row["profit_raw"] < 0 and mon.snapshot()["signal_candidates"] == 0
+    text = mon.prices_text(["WEN.US"])
+    assert "УБЫТОК -0.33 USDC" in text and "По quote: +0.17 USDC" in text
+    assert "ПРИБЫЛЬ В РАСЧЁТЕ" not in text
+    assert "прибыли нет" in mon.text() and "УБЫТОК" not in mon.text()
+
+
+async def test_prices_display_both_directions_without_treating_stock_output_as_usdc():
+    mon, _ = monitored()
+    await mon.quote(("WEN.US", FORWARD))
+    mon.jupiter.quote_pair.return_value = {"outAmount": "18000000", "priceImpact": "0.1"}
+    await mon.quote(("WEN.US", REVERSE))
+    snapshot = mon.snapshot()
+    assert {pair["direction"] for pair in snapshot["prices"]} == {FORWARD, REVERSE}
+    reverse = snapshot["price_catalog"][0]["reverse"]
+    assert reverse["fresh"] and reverse["quoted_profit_raw"] is None
+    assert reverse["buy_quantity"] == reverse["sell_quantity"] == "17.91"
+    text = mon.prices_text(["WEN.US"])
+    assert "BP → Jup: ПРИБЫЛЬ В РАСЧЁТЕ" in text
+    assert "Jup → BP: ПРИБЫЛЬ В РАСЧЁТЕ" in text
+    assert "100 USDC → мин 17.91 шт; продать 17.91 шт за 109.251 USDC" in text
+    assert "18000000 USDC" not in text
+    assert "Акции BP → Jup: WEN.US." in mon.text()
+    assert "Акции Jup → BP: WEN.US." in mon.text()
+    mon.backpack.accept_rfq.assert_not_awaited()
+
+
+async def test_missing_reverse_quote_does_not_claim_a_loss_or_profit_in_that_direction():
+    mon, _ = monitored()
+    await mon.quote(("WEN.US", FORWARD))
+    text = mon.prices_text(["WEN.US"])
+    assert "Jup → BP: нет актуального расчёта" in text
+    assert "Jup → BP: УБЫТОК" not in text and "Jup → BP: ПРИБЫЛЬ" not in text
 
 
 async def test_rfq_rejection_has_safe_reason_without_remote_payload():

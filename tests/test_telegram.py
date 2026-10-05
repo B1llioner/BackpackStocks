@@ -342,7 +342,7 @@ async def test_digest_worker_never_blocks_on_full_network_refresh(bot):
         await asyncio.sleep(1.1)
         assert controller.outbox.qsize() == 1
         item = controller.outbox.get_nowait()
-        assert item[3] == "digest" and "Котировки: 1 свежих" in item[2]
+        assert item[3] == "digest" and "Положительных расчётов после расходов: 1" in item[2]
         assert "Режим:" not in item[2] and "rfqFilled" not in item[2]
         mon.refresh_report.assert_not_called()
     finally:

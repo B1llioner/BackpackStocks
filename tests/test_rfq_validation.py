@@ -231,7 +231,7 @@ async def test_monitor_resizes_to_real_ask_and_never_replaces_it_with_fmv():
     assert mon.backpack.submit_rfq.await_count == 2
     mon.backpack.stock_feed.latest["WEN"] = observed(clock, ask="1")
     assert mon.snapshot()["rows"][0]["cost_raw"] == row["cost_raw"]
-    assert "BP 6.2 / Jup" in mon.text()
+    assert "BP 6.2 / Jup" in mon.prices_text(["WEN.US"])
     mon.backpack.accept_rfq.assert_not_called()
     clock.now += 8
     mon.backpack.stock_feed.latest["WEN"] = observed(clock)
@@ -239,7 +239,7 @@ async def test_monitor_resizes_to_real_ask_and_never_replaces_it_with_fmv():
     assert mon.snapshot()["positive_price_spreads"] == mon.snapshot()["candidates"] == 0
 
 
-async def test_no_buy_quote_excludes_both_directions_and_spread_counters():
+async def test_each_direction_requires_its_own_rfq_and_unavailable_sides_are_excluded():
     mon, clock = monitored()
     original = mon.backpack.rfqs.side_effect
 
@@ -262,8 +262,9 @@ async def test_no_buy_quote_excludes_both_directions_and_spread_counters():
     assert snapshot["positive_price_spreads"] == snapshot["screened_assets"] == snapshot["candidates"] == 0
     assert mon.choose() is None
     assert "Backpack не дал RFQ на этот объём" in mon.text("WEN.US")
-    mon.jupiter.quote_pair.assert_not_called()
-    mon.backpack.submit_rfq.assert_awaited_once()
+    mon.jupiter.quote_pair.assert_awaited_once()
+    assert mon.backpack.submit_rfq.await_count == 2
+    assert [call.kwargs["side"] for call in mon.backpack.submit_rfq.call_args_list] == ["Bid", "Ask"]
     mon.backpack.accept_rfq.assert_not_called()
 
 
@@ -393,7 +394,7 @@ async def test_reverse_rechecks_refused_sell_before_spending_another_jupiter_req
     mon.backpack.accept_rfq.assert_not_called()
 
 
-async def test_reverse_uses_buy_eligibility_but_requires_a_new_exact_sell_price():
+async def test_reverse_requires_a_new_exact_sell_price_when_only_buy_eligibility_is_cached():
     mon, clock = monitored()
     await mon.refresh_rfq_asset(mon.assets["WEN.US"])
     clock.now += 9  # Buy price has expired, but the independent eligibility is valid.
@@ -406,6 +407,46 @@ async def test_reverse_uses_buy_eligibility_but_requires_a_new_exact_sell_price(
     assert mon.backpack.submit_rfq.call_args.args[0] == "17.91"
     assert mon.report()["rows"][0]["backpack_price"] == "6.1"
     mon.backpack.accept_rfq.assert_not_called()
+
+
+async def test_rfq_buy_failure_does_not_hide_an_independent_profitable_sell_direction():
+    mon, _ = monitored()
+    original = mon.backpack.rfqs.side_effect
+
+    async def reject_buy(*args, **kwargs):
+        records = await original(*args, **kwargs)
+        if records[0]["rfq"]["side"] == "Bid":
+            records[0]["rfq"]["status"] = "Expired"
+            records[0]["quotes"] = []
+        return records
+
+    mon.backpack.rfqs.side_effect = reject_buy
+    assert await mon.quote(("WEN.US", FORWARD)) is None
+    assert mon.choose() == ("WEN.US", REVERSE)
+    assert not mon.rfq_cooldown(mon.assets["WEN.US"], REVERSE)
+    mon.jupiter.quote_pair.return_value = {"outAmount": "18000000", "priceImpact": "0.1"}
+    row = await mon.quote(("WEN.US", REVERSE))
+    assert row and row["profit_raw"] == 9_191_000
+    snapshot = mon.snapshot()
+    assert snapshot["rfq_available_assets"] == 0 and snapshot["signal_candidates"] == 1
+    assert [pair["direction"] for pair in snapshot["prices"]] == [REVERSE]
+    assert "Jup → BP" in mon.text() and "после зачисления" in mon.text()
+    assert [call.kwargs["side"] for call in mon.backpack.submit_rfq.call_args_list] == ["Bid", "Ask"]
+    mon.backpack.accept_rfq.assert_not_awaited()
+
+
+async def test_sell_rfq_refusal_does_not_block_buy_rfq_direction():
+    mon, _ = monitored()
+    await mon.refresh_rfq_asset(mon.assets["WEN.US"])
+    mon.rfq.latest[("WEN.US", "Ask")] = mon.rfq.result(
+        "WEN.US", "Ask", "1", "US_EQUITIES_REGULAR", "unavailable", "rfq_insufficient_balance"
+    )
+    assert mon.rfq_cooldown(mon.assets["WEN.US"], REVERSE)
+    assert not mon.rfq_cooldown(mon.assets["WEN.US"], FORWARD)
+    assert mon.choose() == ("WEN.US", FORWARD)
+    row = await mon.quote(("WEN.US", FORWARD))
+    assert row and mon.snapshot()["signal_candidates"] == 1
+    mon.backpack.accept_rfq.assert_not_awaited()
 
 
 async def test_a_failing_hot_route_backs_off_and_other_stocks_keep_running():
