@@ -39,6 +39,7 @@ def decode_pool(account: dict) -> dict:
             "mintB": pub(200),
             "tokenProgramA": pub(232),
             "tokenProgramB": pub(264),
+            "observation": pub(296),
             "decimalsA": data[331],
             "decimalsB": data[332],
             "status": data[329],

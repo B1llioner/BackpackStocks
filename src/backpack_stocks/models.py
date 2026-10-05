@@ -136,6 +136,9 @@ class MonitorPolicy(StrictModel):
 
 class DirectPolicy(StrictModel):
     enable_live: bool = False
+    via_sol: bool = False
+    split_pools: bool = False
+    watched_catalog: str | None = None
     catalog: str = "research/pool-pricing/catalog-native.json"
     clmm_worker: str = "local_clmm/worker.cjs"
     max_pools: int = Field(default=4, ge=1, le=12)

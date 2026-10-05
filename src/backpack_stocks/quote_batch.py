@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from .solana import SolanaRPC
@@ -20,11 +22,31 @@ class AccountRequest:
 class QuoteAccountBatch:
     """Each pool's entire account group stays in one RPC bank, at most 100 addresses."""
 
-    def __init__(self, rpc: SolanaRPC):
+    def __init__(self, rpc: SolanaRPC | QuoteAccountBatch):
         self.rpc = rpc
         self.waiting: list[AccountRequest] = []
         self.tasks: set[asyncio.Task] = set()
         self.scheduled = False
+        self.pool_banks: dict[tuple[str, str, str, int], asyncio.Task] = {}
+
+    async def pool_snapshot(
+        self, key: tuple[str, str, str, int], producer: Callable[[], Awaitable[dict]], max_age: float
+    ) -> dict:
+        """Reuse one validated bank for a request's size grid, preserving its age."""
+        task = self.pool_banks.get(key)
+        if task is not None and task.done() and not task.cancelled() and task.exception() is None:
+            if time.time() - task.result()["observed"] >= max_age / 2:
+                task = None
+        if task is None:
+
+            async def produce():
+                return await producer()
+
+            task = asyncio.create_task(produce())
+            self.pool_banks[key] = task
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+        return await asyncio.shield(task)
 
     async def accounts(
         self, addresses: list[str], *, parsed: bool = False, min_slot: int | None = None, priority: int = 0
@@ -92,6 +114,7 @@ class QuoteAccountBatch:
                 raise
 
     async def close(self) -> None:
+        self.pool_banks.clear()
         for request in self.waiting:
             request.future.cancel()
         self.waiting.clear()

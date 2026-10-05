@@ -381,7 +381,8 @@ async def test_account_batch_rejects_incomplete_old_or_failed_banks(failure):
         await batch.close()
 
 
-async def test_batch_direct_quotes_keep_full_live_account_validation(monkeypatch):
+@pytest.mark.parametrize("via_sol", [False, True])
+async def test_batch_direct_quotes_keep_full_live_account_validation(monkeypatch, via_sol):
     saved = fixture()
     q = saved["quote"]
     monkeypatch.setattr("backpack_stocks.direct.time.time", lambda: q["_observed_at"])
@@ -396,8 +397,10 @@ async def test_batch_direct_quotes_keep_full_live_account_validation(monkeypatch
             }
         )
     )
-    router = DirectRaydium(Settings(dex_backend="raydium"), rpc)
+    router = DirectRaydium(Settings(dex_backend="raydium", direct={"via_sol": via_sol}), rpc)
     router.candidates = {STOCK_MINT: [q["pool"]]}
+    router.sol_candidates = {}
+    router.ensure_candidates = AsyncMock()
     try:
         async with router.batch_quotes() as quote_pair:
             result = await quote_pair(STOCK_MINT, USDC_MINT, 1_000_000, priority=10)

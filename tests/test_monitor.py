@@ -510,6 +510,54 @@ async def test_volume_request_keeps_exact_rfq_budget_after_price_increases(monit
     assert row["backpack_quote_confirmed"]
 
 
+@pytest.mark.parametrize("refresh_available", [True, False])
+async def test_slow_dex_refreshes_expired_rfq_at_identical_quantity_and_uses_new_cost(
+    monitor, refresh_available
+):
+    from backpack_stocks.rfq_validation import RfqCheck
+
+    mon, clock = monitor
+    mon.settings.monitor.rfq_validation = True
+    checks = []
+
+    async def check(symbol, quantity, session):
+        checks.append(quantity)
+        refreshed = len(checks) > 1
+        return RfqCheck(
+            symbol,
+            "Bid",
+            quantity,
+            session,
+            "available" if not refreshed or refresh_available else "unavailable",
+            "rfq_quote_observed" if not refreshed or refresh_available else "rfq_no_quote",
+            clock(),
+            clock() + 3,
+            clock() + 60,
+            "6.1" if refreshed else "6",
+        )
+
+    async def slow_quote(source, target, amount, **kwargs):
+        clock.now += 4
+        return {
+            "inAmount": str(amount),
+            "outAmount": "55000000",
+            "priceImpact": "0.1",
+            "_observed_at": clock(),
+        }
+
+    mon.rfq.check = AsyncMock(side_effect=check)
+    mon.jupiter.quote_pair.side_effect = slow_quote
+    row = await mon.quote(("WEN.US", FORWARD), notional=Decimal(50))
+    assert len(checks) == 2 and Decimal(checks[0]) == Decimal(checks[1])
+    if refresh_available:
+        assert row is not None and row["backpack_price"] == "6.1"
+        assert row["backpack_rfq_valid_until"] > clock()
+        assert row["delivered_raw"] == row["input_raw"]
+        assert row["cost_raw"] > 50_000_000
+    else:
+        assert row is None and mon.failures[("WEN.US", FORWARD)] == "rfq_no_quote"
+
+
 async def test_volume_search_goes_smaller_when_every_coarse_size_exceeds_impact_limit(monitor):
     mon, _ = monitor
 

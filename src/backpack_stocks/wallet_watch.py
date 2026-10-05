@@ -21,12 +21,14 @@ from solders.signature import Signature
 from .models import TOKEN, TOKEN_2022, USDC_MINT
 from .observability import error_code, event
 from .solana import SolanaRPC
+from .wallet_pools import swap_pool_hints
 from .wallet_stream import WalletStream
 
 if TYPE_CHECKING:
     from .monitor import SpreadMonitor
 
 TITAN = "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT"
+JUPITER = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
 BACKPACK_WITHDRAW = "FewRXXTzV2WwigvTQNsVanhEmCM9wzfNvoT1divNtbVH"
 BACKPACK_SENDER = "43DbAvKxhXh1oSxkJSqGosNw3HpBnmsWiak6tB5wpecN"
 POLL_S = 20
@@ -94,6 +96,7 @@ def decode_activity(tx: dict, wallet: str, signature: str, stocks: dict[str, str
         *(i for g in meta.get("innerInstructions") or [] for i in g["instructions"]),
     ]
     programs = sorted({i["programId"] for i in instructions if "programId" in i})
+    pools = swap_pool_hints(instructions)
     keys = tx["transaction"]["message"]["accountKeys"]
     payer = keys[0]["pubkey"] if isinstance(keys[0], dict) else keys[0]
     fee = meta["fee"]
@@ -121,7 +124,7 @@ def decode_activity(tx: dict, wallet: str, signature: str, stocks: dict[str, str
     elif len(legs) == len(known) == 1 and known[0]["raw"] * usdc < 0:
         # A paired balance change alone does not prove a swap; verify the router.
         kind = "sale" if known[0]["raw"] < 0 else "purchase"
-        if TITAN not in programs:
+        if TITAN not in programs and not pools and JUPITER not in programs:
             kind = "paired_transfer"
     elif (
         known
@@ -147,7 +150,14 @@ def decode_activity(tx: dict, wallet: str, signature: str, stocks: dict[str, str
         "usdc_raw": usdc,
         "fee_lamports": fee if payer == wallet else 0,
         "sol_transfer_lamports": tips,
-        "router": "Titan Atlas" if TITAN in programs else None,
+        "router": "Titan Atlas"
+        if TITAN in programs
+        else "Jupiter"
+        if JUPITER in programs
+        else "Raydium"
+        if pools
+        else None,
+        "swap_pools": [] if failed else pools,
         "acquisition_cost_known": False,
     }
 
@@ -497,6 +507,27 @@ class WalletWatcher:
                     self.correlation(record) if not item["historical"] else {"reason": "historical_import"}
                 )
                 relevant = any(leg["asset"] for leg in record["legs"])
+                if record["swap_pools"] and self.monitor is not None:
+                    from .direct import DirectRaydium
+
+                    router = getattr(self.monitor, "jupiter", None)
+                    if isinstance(router, DirectRaydium):
+                        try:
+                            async with asyncio.timeout(5):
+                                await router.register_pool_hints(
+                                    record["swap_pools"],
+                                    [
+                                        {"symbol": a.symbol, "mint": a.mint, "decimals": a.decimals}
+                                        for a in self.monitor.assets.values()
+                                        if self.monitor.chain.get(a.symbol) == "verified_unit_mapping"
+                                    ],
+                                )
+                        except Exception as error:
+                            event(
+                                "wallet_pool_discovery_error",
+                                component="direct_pools",
+                                code=error_code(error),
+                            )
                 self.journal.db.execute(
                     "UPDATE transactions SET body=?,state='ready',notified=?,block_time=? "
                     "WHERE wallet=? AND signature=?",

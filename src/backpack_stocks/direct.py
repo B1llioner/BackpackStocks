@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import struct
 import time
 from collections import Counter
@@ -83,7 +84,10 @@ def checked_clock(account: dict | None) -> tuple[int, int]:
 
 def validate_auxiliary(pool: str, program: str, state: dict, accounts: dict, arrays: list[str]) -> None:
     observation = state["observation"]
-    if observation != pda(program, b"observation", bytes(Pubkey.from_string(pool))):
+    # CLMM swap_v2 constrains this key to PoolState.observation_key. Legacy
+    # pools have a non-PDA oracle; ownership, layout and embedded pool_id still
+    # have to match. CPMM's initialized oracle uses the derived address.
+    if program == CPMM and observation != pda(program, b"observation", bytes(Pubkey.from_string(pool))):
         raise ValueError("Observation PDA mismatch")
     raw = account_bytes(accounts[observation], program, "ObservationState", 4483 if program == CLMM else 4075)
     offset = 19 if program == CLMM else 11
@@ -114,26 +118,51 @@ class DirectRaydium:
         self.worker = ClmmWorker(settings.direct.clmm_worker)
         self.calculator = PoolCalculator()
         catalog_path = Path(settings.direct.catalog)
-        if not catalog_path.exists() and settings.direct.catalog == "research/pool-pricing/catalog-native.json":
+        if (
+            not catalog_path.exists()
+            and settings.direct.catalog == "research/pool-pricing/catalog-native.json"
+        ):
             # Clean installs use public pool addresses, never historical prices.
             # Every bank, reserve and mint is still validated on-chain below.
             catalog_path = Path(__file__).with_name("direct_pool_catalog.json")
         catalog = json.loads(catalog_path.read_text())
+        self.observed_pools: set[str] = set()
+        if settings.direct.watched_catalog and Path(settings.direct.watched_catalog).exists():
+            watched = json.loads(Path(settings.direct.watched_catalog).read_text())
+            self.observed_pools = {row["address"] for row in watched["pools"]}
+            catalog["pools"] = [*catalog["pools"], *watched["pools"]]
+            catalog["assets"] = [*catalog["assets"], *watched.get("assets", [])]
         self.assets = {a["mint"]: a for a in catalog["assets"]}
         self.by_symbol = {a["symbol"]: a for a in self.assets.values()}
         self.candidates: dict[str, list[str]] = {}
+        self.sol_candidates: dict[str, list[str]] = {}
         grouped: dict[str, list[tuple[int, str]]] = {}
+        sol_grouped: dict[str, list[tuple[int, str]]] = {}
         for pool in catalog["pools"]:
             pair = {pool.get("mintA"), pool.get("mintB")}
             mint = next((m for m in pair if m in self.assets), None)
             state = pool.get("snapshot", {}).get("state", {})
-            if mint and USDC_MINT in pair and state.get("kind") in {"cpmm", "clmm"}:
+            if mint and pair & {USDC_MINT, WSOL} and state.get("kind") in {"cpmm", "clmm"}:
                 # Historical liquidity is only discovery priority, never a quote.
                 weight = int(state.get("liquidity", state.get("reserveB", "0")))
-                grouped.setdefault(mint, []).append((weight, pool["address"]))
+                if pool.get("watched"):
+                    weight += 2**256
+                target = grouped if USDC_MINT in pair else sol_grouped
+                target.setdefault(mint, []).append((weight, pool["address"]))
         for mint, rows in grouped.items():
-            self.candidates[mint] = [a for _, a in sorted(rows, reverse=True)[: settings.direct.max_pools]]
-        selected_addresses = {a for addresses in self.candidates.values() for a in addresses}
+            self.candidates[mint] = list(dict.fromkeys(a for _, a in sorted(rows, reverse=True)))[
+                : settings.direct.max_pools
+            ]
+        for mint, rows in sol_grouped.items():
+            self.sol_candidates[mint] = list(dict.fromkeys(a for _, a in sorted(rows, reverse=True)))[
+                : settings.direct.max_pools
+            ]
+        selected_addresses = {
+            a
+            for group in (self.candidates, self.sol_candidates)
+            for addresses in group.values()
+            for a in addresses
+        }
         self.pool_catalog = {p["address"]: p for p in catalog["pools"] if p["address"] in selected_addresses}
         self.semaphore = asyncio.Semaphore(settings.direct.concurrency)
         self.quote_count = 0
@@ -141,6 +170,118 @@ class DirectRaydium:
         self.cached_prices: dict[str, tuple[float, str]] = {}
         self.screen_status: dict = {}
         self.gas_pools: list[str] = []
+        self.gas_discovery_lock = asyncio.Lock()
+        self.discovery_lock = asyncio.Lock()
+        self.discovery_checked: dict[str, float] = {}
+
+    def update_assets(self, assets: list[dict]) -> None:
+        for row in assets:
+            Pubkey.from_string(row["mint"])
+            self.assets[row["mint"]] = row
+            self.by_symbol[row["symbol"]] = row
+
+    async def ensure_candidates(self, mint: str) -> None:
+        if self.candidates.get(mint) and (not self.settings.direct.via_sol or self.sol_candidates.get(mint)):
+            return
+        async with self.discovery_lock:
+            if time.time() - self.discovery_checked.get(mint, 0) < 300:
+                return
+            self.discovery_checked[mint] = time.time()
+            ray = Raydium(self.rpc, proxy=resolve_proxy("RAYDIUM"))
+            try:
+                for quote_mint, group in [
+                    (USDC_MINT, self.candidates),
+                    *([(WSOL, self.sol_candidates)] if self.settings.direct.via_sol else []),
+                ]:
+                    if len(group.get(mint, [])) >= self.settings.direct.max_pools:
+                        continue
+                    found = await ray.pools(mint, quote_mint)
+                    rows = [p for p in found if p["programId"] in {CLMM, CPMM}][
+                        : self.settings.direct.max_pools
+                    ]
+                    if not rows:
+                        continue
+                    response = await self.rpc.accounts([p["id"] for p in rows])
+                    for p, account in zip(rows, response["value"], strict=True):
+                        if not account or account["owner"] != p["programId"]:
+                            continue
+                        state = decode_pool(account)
+                        if {state["mintA"], state["mintB"]} != {mint, quote_mint}:
+                            continue
+                        address = p["id"]
+                        self.pool_catalog[address] = {
+                            "address": address,
+                            "program": account["owner"],
+                            "mintA": state["mintA"],
+                            "mintB": state["mintB"],
+                            "snapshot": {"state": state},
+                        }
+                        group[mint] = list(dict.fromkeys([*group.get(mint, []), address]))[
+                            : self.settings.direct.max_pools
+                        ]
+            finally:
+                await ray.close()
+
+    async def register_pool_hints(self, hints: list[dict], assets: list[dict]) -> int:
+        """Validate observed pool ownership/pair before adding bounded discovery refs."""
+        if not self.settings.direct.watched_catalog:
+            return 0
+        references = {
+            row["pool"]: row["program"]
+            for row in hints
+            if row.get("program") in {CLMM, CPMM} and row.get("pool") not in self.observed_pools
+        }
+        references = dict(list(references.items())[:24])
+        if not references:
+            return 0
+        for address in references:
+            Pubkey.from_string(address)
+        response = await self.rpc.accounts(list(references), priority=5)
+        supported = {row["mint"]: row for row in assets}
+        added = []
+        for address, account in zip(references, response["value"], strict=True):
+            if not account or account["owner"] != references[address]:
+                continue
+            state = decode_pool(account)
+            pair = {state["mintA"], state["mintB"]}
+            stock = next((mint for mint in pair if mint in supported), None)
+            if stock is None or len(pair & {USDC_MINT, WSOL}) != 1:
+                continue
+            if state["decimalsA" if state["mintA"] == stock else "decimalsB"] != supported[stock]["decimals"]:
+                continue
+            self.assets[stock] = supported[stock]
+            self.by_symbol[supported[stock]["symbol"]] = supported[stock]
+            row = {
+                "address": address,
+                "program": account["owner"],
+                "mintA": state["mintA"],
+                "mintB": state["mintB"],
+                "watched": True,
+                "snapshot": {"state": state},
+            }
+            self.pool_catalog[address] = row
+            group = self.candidates if USDC_MINT in pair else self.sol_candidates
+            group[stock] = list(dict.fromkeys([address, *group.get(stock, [])]))[
+                : self.settings.direct.max_pools
+            ]
+            added.append(row)
+        if added:
+            path = Path(self.settings.direct.watched_catalog)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            watched = json.loads(path.read_text()) if path.exists() else {"pools": [], "assets": []}
+            merged = {row["address"]: row for row in [*watched["pools"], *added]}
+            if len(merged) > 2048:
+                raise ValueError("Watched pool discovery exceeds bound")
+            watched_assets = {row["mint"]: row for row in [*watched.get("assets", []), *supported.values()]}
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps({"pools": list(merged.values()), "assets": list(watched_assets.values())})
+            )
+            os.chmod(temporary, 0o600)
+            temporary.replace(path)
+            self.observed_pools.update(row["address"] for row in added)
+            event("wallet_pools_registered", quotes=len(added), component="direct_pools")
+        return len(added)
 
     @property
     def interval(self) -> float:
@@ -155,6 +296,9 @@ class DirectRaydium:
             "cpmm_backend": self.calculator.backend,
             "rpc": self.rpc.http.status(),
             "screen": self.screen_status,
+            "via_sol": self.settings.direct.via_sol,
+            "split_pools": self.settings.direct.split_pools,
+            "sol_assets": len(self.sol_candidates),
         }
 
     async def close(self) -> None:
@@ -169,16 +313,37 @@ class DirectRaydium:
         selected = [
             (mint, address) for mint in dict.fromkeys(mints) for address in self.candidates.get(mint, [])
         ]
+        seed_refs, seed_entries = [CLOCK], []
+        if self.settings.direct.via_sol and self.sol_candidates:
+            bridges = await self.bridge_pools()
+            if bridges:
+                bridge = bridges[0]
+                response = await self.rpc.accounts([bridge], priority=5)
+                account = response["value"][0]
+                state = decode_pool(account)
+                if {state["mintA"], state["mintB"]} != {WSOL, USDC_MINT}:
+                    raise ValueError("Direct pool pair/program mismatch")
+                self.pool_catalog[bridge] = {"program": account["owner"], "snapshot": {"state": state}}
+                seed_refs += [
+                    bridge,
+                    *([state["vaultA"], state["vaultB"]] if state["kind"] == "cpmm" else []),
+                ]
+                seed_entries = [(WSOL, bridge)]
+                selected += [
+                    (mint, address)
+                    for mint in dict.fromkeys(mints)
+                    for address in self.sol_candidates.get(mint, [])
+                ]
         chunks: list[tuple[list[str], list[tuple[str, str]]]] = []
-        refs = [CLOCK]
-        entries: list[tuple[str, str]] = []
+        refs = list(seed_refs)
+        entries: list[tuple[str, str]] = list(seed_entries)
         for mint, address in selected:
             state = self.pool_catalog[address]["snapshot"]["state"]
             group = [address, *([state["vaultA"], state["vaultB"]] if state["kind"] == "cpmm" else [])]
             extra = [a for a in group if a not in refs]
             if len(refs) + len(extra) > 100:
                 chunks.append((refs, entries))
-                refs, entries = [CLOCK], []
+                refs, entries = list(seed_refs), list(seed_entries)
                 extra = group
             refs.extend(extra)
             entries.append((mint, address))
@@ -193,14 +358,18 @@ class DirectRaydium:
             observed = time.time()
             if abs(observed - timestamp) > 30:
                 raise ValueError("RPC finalized bank is too old")
+            sol_price = None
             for mint, address in entries:
                 try:
                     account = accounts[address]
                     program = self.pool_catalog[address]["program"]
                     data = account_bytes(account, program, "PoolState", 1544 if program == CLMM else 637)
                     state = decode_pool(account)
-                    if {state["mintA"], state["mintB"]} != {mint, USDC_MINT} or (
-                        state["decimalsA"] != 6 or state["decimalsB"] != 6
+                    pair = {state["mintA"], state["mintB"]}
+                    quote_mint = USDC_MINT if USDC_MINT in pair else WSOL
+                    expected = {mint: 9 if mint == WSOL else 6, quote_mint: 9 if quote_mint == WSOL else 6}
+                    if pair != {mint, quote_mint} or any(
+                        state["decimals" + side] != expected[state["mint" + side]] for side in ("A", "B")
                     ):
                         raise ValueError("Direct pool pair/program mismatch")
                     if state["status"] & (16 if program == CLMM else 4):
@@ -232,9 +401,16 @@ class DirectRaydium:
                         )
                     if spot <= 0:
                         raise ValueError("Nonpositive pool spot")
+                    normalized = spot if state["mintA"] == mint else 1 / spot
+                    if mint == WSOL:
+                        sol_price = normalized
+                    elif quote_mint == WSOL:
+                        if sol_price is None:
+                            raise ValueError("SOL bridge spot unavailable")
+                        normalized *= sol_price
                     prices.setdefault(mint, []).append(
                         {
-                            "price": spot if state["mintB"] == USDC_MINT else 1 / spot,
+                            "price": normalized,
                             "pool": address,
                             "observed_at": observed,
                             "slot": response["context"]["slot"],
@@ -295,16 +471,25 @@ class DirectRaydium:
         stock = target if source == USDC_MINT else source
         if USDC_MINT not in {source, target} or stock not in {*self.assets, WSOL}:
             raise ValueError("Direct router supports catalogued stock/USDC pairs only")
+        if self.settings.direct.via_sol and stock != WSOL:
+            from .direct_routes import composed_quote
+
+            await self.ensure_candidates(stock)
+
+            if _rpc is None:
+                async with self.semaphore, self.batch_quotes() as batch_quote:
+                    # batch_quotes exposes its account reader through the bound partial.
+                    return await composed_quote(
+                        self, source, target, amount, priority, batch_quote.keywords["_rpc"]
+                    )
+            scope = QuoteAccountBatch(_rpc)
+            try:
+                return await composed_quote(self, source, target, amount, priority, scope)
+            finally:
+                await scope.close()
         pools = self.candidates.get(stock, [])
         if stock == WSOL:
-            if not self.gas_pools:
-                ray = Raydium(self.rpc, proxy=resolve_proxy("RAYDIUM"))
-                try:
-                    found = await ray.pools(WSOL, USDC_MINT)
-                finally:
-                    await ray.close()
-                self.gas_pools = [p["id"] for p in found if p["programId"] in {CLMM, CPMM}][:2]
-            pools = self.gas_pools
+            pools = await self.bridge_pools()
         started = time.time()
         results = await asyncio.gather(
             *(self._limited_quote(address, source, target, amount, priority, _rpc) for address in pools),
@@ -338,6 +523,17 @@ class DirectRaydium:
         best.update(_request_started_at=started, candidate_pools=len(pools), successful_pools=len(valid))
         return best
 
+    async def bridge_pools(self) -> list[str]:
+        async with self.gas_discovery_lock:
+            if not self.gas_pools:
+                ray = Raydium(self.rpc, proxy=resolve_proxy("RAYDIUM"))
+                try:
+                    found = await ray.pools(WSOL, USDC_MINT)
+                finally:
+                    await ray.close()
+                self.gas_pools = [p["id"] for p in found if p["programId"] in {CLMM, CPMM}][:2]
+            return list(self.gas_pools)
+
     async def _limited_quote(
         self,
         address: str,
@@ -352,7 +548,7 @@ class DirectRaydium:
         async with self.semaphore:
             return await self.pool_quote(address, source, target, amount, priority=priority)
 
-    async def pool_quote(
+    async def _pool_bank(
         self,
         pool: str,
         source: str,
@@ -373,11 +569,6 @@ class DirectRaydium:
             initial_state["mintB"],
         }:
             raise ValueError("Direct pool pair/program mismatch")
-        initial_state["observation"] = (
-            initial_state["observation"]
-            if program == CLMM
-            else str(Pubkey.from_bytes(base64.b64decode(initial["value"][0]["data"][0])[296:328]))
-        )
         bitmap = pda(CLMM, b"pool_tick_array_bitmap_extension", bytes(Pubkey.from_string(pool)))
         arrays: list[str] = []
         min_slot = initial["context"]["slot"]
@@ -411,8 +602,7 @@ class DirectRaydium:
         accounts = dict(zip(refs, response["value"], strict=True))
         account_bytes(accounts[pool], program, "PoolState", 1544 if program == CLMM else 637)
         state = decode_pool(accounts[pool])
-        state["observation"] = initial_state["observation"]
-        for key in ("config", "vaultA", "vaultB", "mintA", "mintB"):
+        for key in ("config", "vaultA", "vaultB", "mintA", "mintB", "observation"):
             if state[key] != initial_state[key]:
                 raise ValueError("Pool routing changed during refresh")
         if state["status"] & (16 if program == CLMM else 4):
@@ -460,6 +650,40 @@ class DirectRaydium:
                     raise ValueError("Empty effective reserves")
                 state["reserve" + side] = str(reserve)
         validate_auxiliary(pool, program, state, accounts, arrays)
+        return {
+            "state": state,
+            "program": program,
+            "accounts": accounts,
+            "arrays": arrays,
+            "bitmap": bitmap,
+            "timestamp": timestamp,
+            "observed": observed,
+            "response": response,
+        }
+
+    async def pool_quote(
+        self,
+        pool: str,
+        source: str,
+        target: str,
+        amount: int,
+        *,
+        priority: int = 0,
+        _rpc: QuoteAccountBatch | None = None,
+    ) -> dict:
+        if type(amount) is not int or not 0 < amount < 2**63 or source == target:
+            raise ValueError("Invalid exact-in amount/pair")
+        fetch = partial(self._pool_bank, pool, source, target, amount, priority=priority, _rpc=_rpc)
+        bank = (
+            await _rpc.pool_snapshot(
+                (pool, source, target, priority), fetch, self.settings.policy.quote_max_age_s
+            )
+            if _rpc is not None and self.settings.direct.via_sol
+            else await fetch()
+        )
+        state, program, accounts = bank["state"], bank["program"], bank["accounts"]
+        arrays, bitmap = list(bank["arrays"]), bank["bitmap"]
+        timestamp, observed, response = bank["timestamp"], bank["observed"], bank["response"]
         direction = source == state["mintA"]
         if program == CPMM:
             state["quoteSupported"] = True
@@ -517,7 +741,8 @@ class DirectRaydium:
         )
         impact = max(Decimal(0), (1 - Decimal(output) / ideal) * 100)
         stock = source if source != USDC_MINT else target
-        self.cached_prices[stock] = (observed, str(spot if state["mintB"] == USDC_MINT else 1 / spot))
+        if USDC_MINT in {source, target}:
+            self.cached_prices[stock] = (observed, str(spot if state["mintB"] == USDC_MINT else 1 / spot))
         return {
             "inputMint": source,
             "outputMint": target,
@@ -530,6 +755,18 @@ class DirectRaydium:
             "source": "fresh local Raydium exact-in",
             "pool": pool,
             "kind": state["kind"],
+            "direct_execution_supported": True,
+            "routePlan": [
+                {
+                    "percent": 100,
+                    "swapInfo": {
+                        "ammKey": pool,
+                        "label": "Raydium " + state["kind"].upper(),
+                        "inputMint": source,
+                        "outputMint": target,
+                    },
+                }
+            ],
             "contextSlot": response["context"]["slot"],
             "_observed_at": observed,
             "_direct": {

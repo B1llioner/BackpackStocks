@@ -27,12 +27,12 @@ chmod 600 .env
 | `OUTBOUND_PROXY_URL` | Свой `http://user:password@host:port` или `https://...`. Учебный адрес заменить. Спецсимволы в логине/пароле должны быть URL-encoded. |
 | `JUPITER_REPLAY_PROXY` | Необязательно: отдельный HTTP(S) proxy Jupiter вместо общего. |
 | `JUPITER_QUOTE_WALLET` | Необязательно: публичный адрес Solana для контекста quote, подпись не нужна. |
-| `JUPITER_API_KEY` | Необязательно: свой developer key для developer API/CLI. Monitor Manual использует веб-процесс сайта. |
+| `JUPITER_API_KEY` | Необязательно: свой developer key для developer API/CLI. Основной pool-монитор не требует API Jupiter. |
 | `JUPITER_REPLAY_WEBSITE_KEY` | Обычно не нужно: publishable config сайта скачивается скриптом установки. |
 
 Поля `SOLANA_WALLET_KEY` и `SOLANA_KEYPAIR_BASE64` для paper/монитора оставьте пустыми. Они нужны только отдельным реальным операциям. При необходимости заполните отдельные `*_PROXY_URL` для Backpack/WS/RPC/Telegram; пустые поля используют общий маршрут. HTTP Jupiter использует `curl_cffi` с Chrome TLS/HTTP2; заданный прокси не заменяется молча прямым соединением. Jupiter replay требует HTTP(S) proxy.
 
-Загрузите публичный конфиг Jupiter:
+Для альтернативных котировок через frontend Jupiter загрузите его публичный конфиг:
 
 ```bash
 .venv/bin/python scripts/setup_jupiter.py --env-file .env
@@ -41,6 +41,8 @@ chmod 600 .env
 Скрипт не читает кошелёк или cookies и не отправляет сделки. Он скачивает один публичный JS, проверяет SHA-256 и сохраняет его в игнорируемый `data/jupiter`. Если файл изменился или удалён, скрипт останавливается: после проверки новой сборки обновите pin в `src/backpack_stocks/jupiter_frontend_source.json`.
 
 Публичный список адресов Raydium-пулов поставляется в `src/backpack_stocks/direct_pool_catalog.json`. Он нужен только для поиска маршрутов: цены, резервы и mint capabilities читаются и проверяются в текущем RPC. Локальный каталог из `research/` для чистой установки не требуется.
+
+Профиль auto по умолчанию считает непосредственно по Raydium CLMM/CPMM: пары акция/USDC, пути через SOL и ограниченный подбор split. Пулы из успешных сделок `/watch` проверяются через RPC и добавляются в discovery-кеш `state/watched-pools.json`. Meteora, Orca и другие программы этот локальный роутер пока не считает. Для альтернативы Jupiter: `monitor.quote_backend = "jupiter"`. При изменении конфигурации задайте новый `database`: существующая база защищена от подмены политики. Pool-профиль использует `state/telegram-direct-paper-pools.sqlite3`; прежняя paper-база сохраняется.
 
 ## Rust-ускорение
 

@@ -159,6 +159,8 @@ class DirectSwapGuard:
         self.router, self.rpc, self._key, self.settings = router, rpc, key, settings
 
     async def prepare(self, q: dict, amount: int, minimum: int, *, mint: str | None = None) -> dict:
+        if q.get("direct_execution_supported") is False:
+            raise ValueError("Composed direct route has no guarded atomic execution builder")
         minimum = max(minimum, int(q["otherAmountThreshold"]))
         source, target = q["inputMint"], q["outputMint"]
         if int(q["inAmount"]) != amount or (mint is not None and source != mint):

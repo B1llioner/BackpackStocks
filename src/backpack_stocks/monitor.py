@@ -297,6 +297,16 @@ class SpreadMonitor:
                 self.retry_after.pop(key, None)
                 self.quote_failures.pop(key, None)
         self.assets, self.chain, self.metadata_at = found, chain, self.clock()
+        from .direct import DirectRaydium
+
+        if isinstance(self.jupiter, DirectRaydium):
+            self.jupiter.update_assets(
+                [
+                    {"symbol": a.symbol, "mint": a.mint, "decimals": a.decimals}
+                    for a in entries
+                    if chain.get(a.symbol) == "verified_unit_mapping"
+                ]
+            )
         self.sessions, self.holidays = sessions, holidays
         if self.settings.monitor.spot_books:
             try:
@@ -434,7 +444,11 @@ class SpreadMonitor:
         try:
             obs = self.rfq_observation(asset, direction)
             session = self.quantity_session(obs)
-            if spot and self.settings.monitor.rfq_validation and not self.rfq_ready(asset, session, direction):
+            if (
+                spot
+                and self.settings.monitor.rfq_validation
+                and not self.rfq_ready(asset, session, direction)
+            ):
                 return spot
         except (ValueError, KeyError, TypeError):
             if spot:
@@ -739,7 +753,12 @@ class SpreadMonitor:
         except (ValueError, KeyError, TypeError):
             return True
         block = self.rfq.blocked(asset.symbol, session, "Bid" if direction == FORWARD else "Ask")
-        if direction == FORWARD and self.settings.monitor.auto_size and block and block.reason in SIZE_REFUSALS:
+        if (
+            direction == FORWARD
+            and self.settings.monitor.auto_size
+            and block
+            and block.reason in SIZE_REFUSALS
+        ):
             block = None
         return bool(block)
 
@@ -934,7 +953,9 @@ class SpreadMonitor:
         fill = self.books.fill(
             asset.symbol, row["acquired_raw"] if buy else row["sellable_raw"], "Bid" if buy else "Ask"
         )
-        if not buy and (not asset.deposit_enabled or ui(row["minimum_output_raw"], asset.decimals) < asset.deposit_min):
+        if not buy and (
+            not asset.deposit_enabled or ui(row["minimum_output_raw"], asset.decimals) < asset.deposit_min
+        ):
             raise ValueError("Reverse deposit unavailable")
         if self.books.markets[asset.symbol].symbol != row["backpack_market"] or (
             buy and not self.books.capacity_valid(asset.symbol, fill, row["book_capacity_checked_at"])
@@ -1038,6 +1059,15 @@ class SpreadMonitor:
                 obs = self.observation(asset)
             if self.quantity_session(obs) != obs.session and rfq_check:
                 raise RfqUnavailable("rfq_session_unavailable")
+            if direction == FORWARD and rfq_check and not rfq_check.usable(self.clock()):
+                # Route discovery can outlive a short RFQ. Refresh exactly the
+                # bought quantity; resizing here would invalidate the DEX input.
+                rfq_check = await self.rfq.check(
+                    symbol, str(ui(acquired, asset.decimals)), self.quantity_session(obs)
+                )
+                if not rfq_check.usable(self.clock()):
+                    raise RfqUnavailable(rfq_check.reason)
+                obs = obs.model_copy(update={"ask": rfq_check.price, "timestamp": rfq_check.checked_at})
             quoted_output = int(quote["outAmount"])
             reserved_output = quoted_output * (10000 - p.slippage_bps) // 10000
             provider_minimum = int(quote.get("otherAmountThreshold", quoted_output))
@@ -1130,6 +1160,7 @@ class SpreadMonitor:
                 and impact <= dec(p.max_price_impact_pct)
                 and int(quote.get("slippageBps") or 0) <= p.slippage_bps,
                 "trading_supported": asset.mint == STOCK_MINT
+                and quote.get("direct_execution_supported", True)
                 and direction == FORWARD
                 and quote.get("quote_source") != "jupiter_flow"
                 and self.quote_backend == self.settings.dex_backend,
@@ -2019,7 +2050,9 @@ class SpreadMonitor:
                 lines.append(f"{row['asset']}: {block_text(row['candidate_blocks'])}")
             if prices:
                 lines.append(f"Обновлено {quote_time(max(pair['updated_at'] for pair in prices))}")
-                lines.append("Объёмы, результат и оба направления: /prices" + (f" {symbol}" if symbol else ""))
+                lines.append(
+                    "Объёмы, результат и оба направления: /prices" + (f" {symbol}" if symbol else "")
+                )
             else:
                 session_message = session_text(snapshot)
                 if session_message:
@@ -2041,9 +2074,12 @@ class SpreadMonitor:
                 )
                 if retry > 0:
                     lines.append(f"Повтор запроса {symbol} через {retry:.0f}с.")
-        for direction, label in ((FORWARD, "BP → Jup"), (REVERSE, "Jup → BP")):
+        label = dex_label({"quote_backend": self.quote_backend})
+        for direction, direction_label in ((FORWARD, f"BP → {label}"), (REVERSE, f"{label} → BP")):
             tickers = sorted({r["asset"] for r in prices if r["direction"] == direction})
-            lines.append(f"Акции {label}: {', '.join(tickers) if tickers else 'нет свежих расчётов'}.")
+            lines.append(
+                f"Акции {direction_label}: {', '.join(tickers) if tickers else 'нет свежих расчётов'}."
+            )
         return "\n".join(lines)
 
     def prices_text(
@@ -2160,6 +2196,7 @@ def price_pair(row: dict) -> dict:
         "backpack_deposit_required": row.get("backpack_deposit_required", row["direction"] == REVERSE),
         "candidate_blocks": row.get("candidate_blocks", []),
         "stock_decimals": decimals,
+        "route_markets": row.get("route_markets", []),
     }
 
 
@@ -2170,6 +2207,14 @@ def signed_profit(value: int) -> str:
 def venue_links(row: dict) -> list[str]:
     ticker = url_quote(row["asset"].removesuffix(".US"), safe="")
     links = [f"Backpack: https://backpack.exchange/stocks/{ticker}"]
+    if row.get("quote_backend") == "raydium":
+        for market in row.get("route_markets", [])[:4]:
+            pool = market.get("pool", "")
+            try:
+                Pubkey.from_string(pool)
+            except ValueError:
+                continue
+            links.append(f"Пул {market.get('label', 'Raydium')}: https://solscan.io/account/{pool}")
     if row.get("mint"):
         source, target = (row["mint"], USDC_MINT) if row["direction"] == FORWARD else (USDC_MINT, row["mint"])
         links.append("Jupiter: https://jup.ag/swap?" + urlencode({"sell": source, "buy": target}))
@@ -2180,7 +2225,10 @@ def price_report(record: dict) -> list[str]:
     direction = price_direction(record)
     if record.get("dex_price") is None:
         reasons = [code for code in record.get("reasons", []) if code != "nonpositive_net"]
-        return [f"{direction}: нет актуального расчёта" + (" · " + block_text(reasons) if reasons else ""), *venue_links(record)]
+        return [
+            f"{direction}: нет актуального расчёта" + (" · " + block_text(reasons) if reasons else ""),
+            *venue_links(record),
+        ]
     if not record["fresh"]:
         reasons = [
             code
@@ -2316,7 +2364,11 @@ def quote_details(row: dict) -> list[str]:
         lines.append(f"Jupiter flow: {row.get('quote_profile', 'manual')}; котировка без исполнения")
     markets = row.get("route_markets", [])
     if markets:
-        names = {USDC_MINT: "USDC", row.get("mint"): row.get("asset", "акции").removesuffix(".US")}
+        names = {
+            USDC_MINT: "USDC",
+            "So11111111111111111111111111111111111111112": "SOL",
+            row.get("mint"): row.get("asset", "акции").removesuffix(".US"),
+        }
 
         def leg(market: dict) -> str:
             source, target = market.get("input_mint"), market.get("output_mint")
