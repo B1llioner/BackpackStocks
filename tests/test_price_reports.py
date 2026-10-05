@@ -175,6 +175,54 @@ async def test_jupiter_failure_logs_http_status_and_fixed_error_code():
         await client.close()
 
 
+@pytest.mark.parametrize("status", [200, 400])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error": "Insufficient liquidity", "token": "private-secret"},
+        {"error": {"message": "Insufficient liquidity", "token": "private-secret"}},
+        {"error": "INSUFFICIENT_LIQUIDITY"},
+        {"code": "INSUFFICIENT_LIQUIDITY", "error": "private-secret"},
+    ],
+)
+async def test_jupiter_liquidity_refusal_is_safe_and_never_retried(status, payload):
+    requests = []
+
+    def server(request):
+        requests.append(request)
+        return httpx.Response(status, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as http:
+        client = JupiterReplay(client=http, interval=0)
+        with pytest.raises(ReplayError) as caught:
+            await client.request("GET", client.base + "/order")
+        assert caught.value.code == "jupiter_insufficient_liquidity"
+        assert caught.value.status_code == status and len(requests) == 1
+        assert "private-secret" not in str(caught.value)
+        assert "private-secret" not in str(api_error_metadata(payload))
+
+
+@pytest.mark.parametrize("direction", [FORWARD, REVERSE])
+async def test_jupiter_liquidity_refusal_clears_old_call_without_runtime_error(direction, caplog):
+    mon, _ = monitored()
+    if direction == REVERSE:
+        mon.jupiter.quote_pair.return_value = {"outAmount": "18000000", "priceImpact": "0.1"}
+    key = ("WEN.US", direction)
+    assert await mon.quote(key)
+    assert mon.snapshot()["rows"]
+    mon.jupiter.quote_pair.side_effect = ReplayError(
+        "HTTP 400", code="jupiter_insufficient_liquidity", status_code=400
+    )
+    assert await mon.quote(key) is None
+    assert key not in mon.results and not mon.snapshot()["rows"]
+    assert mon.errors["quote"] == 0
+    assert mon.blocked["jupiter_insufficient_liquidity"] == 1
+    assert not mon.quote_failures[key] and key not in mon.retry_after
+    assert "Jupiter: не хватает ликвидности на этот объём" in mon.prices_text(["WEN.US"])
+    assert "quote_error" not in [record.message for record in caplog.records]
+    mon.backpack.accept_rfq.assert_not_awaited()
+
+
 async def test_telegram_long_price_text_never_silently_truncates():
     sent = []
 

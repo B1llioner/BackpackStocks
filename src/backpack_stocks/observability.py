@@ -113,6 +113,7 @@ MARKET_BLOCKS = {
     "rfq_insufficient_balance",
     "rfq_invalid_quantity",
     "jupiter_no_route",
+    "jupiter_insufficient_liquidity",
     "rfq_auth_required",
     "rfq_budget_changed",
     "reverse_unavailable",

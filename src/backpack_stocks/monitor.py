@@ -77,6 +77,7 @@ BLOCK_LABELS = {
     "no_tick_liquidity": "нет доступных directional tick arrays",
     "ReplayError": "Jupiter не дал корректную котировку",
     "jupiter_no_route": "Jupiter не нашёл маршрут на этот объём",
+    "jupiter_insufficient_liquidity": "Jupiter: не хватает ликвидности на этот объём",
     "jupiter_http_error": "Jupiter вернул ошибку HTTP",
     "jupiter_transport_error": "нет ответа Jupiter через прокси",
     "jupiter_invalid_response": "Jupiter вернул некорректную котировку",
@@ -2181,9 +2182,15 @@ def price_report(record: dict) -> list[str]:
         reasons = [code for code in record.get("reasons", []) if code != "nonpositive_net"]
         return [f"{direction}: нет актуального расчёта" + (" · " + block_text(reasons) if reasons else ""), *venue_links(record)]
     if not record["fresh"]:
+        reasons = [
+            code
+            for code in record.get("reasons", [])
+            if code not in {"nonpositive_net", "stale_exact_quote", "no_exact_quote"}
+        ]
         return [
             f"{direction}: котировка устарела · {record['quote_age_s']:.0f}с",
             f"Последний расчёт {quote_time(record['updated_at'], zone=False)}; прибыль сейчас не оценена.",
+            *(["Сейчас: " + block_text(reasons)] if reasons else []),
             *venue_links(record),
         ]
     profit = record["profit_raw"]

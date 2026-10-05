@@ -381,7 +381,10 @@ class JupiterReplay:
             detail = api_error_metadata(data)
             raise ReplayError(
                 f"{method} {endpoint}: HTTP {response.status_code}; no automatic retry",
-                code="jupiter_no_route" if detail.get("reason") == "no_route" else "jupiter_http_error",
+                code={
+                    "no_route": "jupiter_no_route",
+                    "insufficient_liquidity": "jupiter_insufficient_liquidity",
+                }.get(detail.get("reason", ""), "jupiter_http_error"),
                 status_code=response.status_code,
                 api_code=detail.get("api_code"),
             )
@@ -389,7 +392,10 @@ class JupiterReplay:
             detail = api_error_metadata(data)
             raise ReplayError(
                 "API returned an invalid/error response; inspect sanitized audit",
-                code="jupiter_no_route" if detail.get("reason") == "no_route" else "jupiter_invalid_response",
+                code={
+                    "no_route": "jupiter_no_route",
+                    "insufficient_liquidity": "jupiter_insufficient_liquidity",
+                }.get(detail.get("reason", ""), "jupiter_invalid_response"),
                 status_code=response.status_code,
                 api_code=detail.get("api_code"),
             )

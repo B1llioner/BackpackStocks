@@ -23,6 +23,7 @@ def api_error_metadata(payload: object) -> dict:
         "MARKET_CLOSED": "market_closed",
         "COULD_NOT_FIND_ANY_ROUTE": "no_route",
         "NO_ROUTES_FOUND": "no_route",
+        "INSUFFICIENT_LIQUIDITY": "insufficient_liquidity",
         "TOKEN_NOT_TRADABLE": "token_not_tradable",
     }
     result = {}
@@ -38,6 +39,8 @@ def api_error_metadata(payload: object) -> dict:
             result["reason"] = "insufficient_balance"
         elif "insufficient collateral" in normalized:
             result["reason"] = "insufficient_collateral"
+        elif "insufficient liquidity" in normalized:
+            result["reason"] = "insufficient_liquidity"
         elif "rfq" in normalized and "expired" in normalized:
             result["reason"] = "rfq_expired"
         elif any(text in normalized for text in ("no route found", "could not find any route")):
