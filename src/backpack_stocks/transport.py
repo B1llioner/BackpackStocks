@@ -53,8 +53,13 @@ class Transport:
         max_response_bytes: int = 5_000_000,
         proxy: str | None = None,
         rate_headers: bool = False,
+        rate_limit_fallback_s: float | None = None,
         oldest_every: int | None = None,
     ):
+        if rate_limit_fallback_s is not None and (
+            not math.isfinite(rate_limit_fallback_s) or rate_limit_fallback_s <= 0
+        ):
+            raise ValueError("Rate-limit fallback must be a positive finite delay")
         proxy = checked_proxy(proxy)
         if client is not None and proxy is not None:
             raise ValueError("Configure the proxy on the supplied HTTP client")
@@ -74,6 +79,7 @@ class Transport:
         self.byte_budget, self.max_response_bytes = byte_budget, max_response_bytes
         self.byte_history: deque[tuple[float, int]] = deque()
         self.rate_headers = rate_headers
+        self.rate_limit_fallback_s = rate_limit_fallback_s
         self.remote_budgets: dict[str, dict[str, float]] = {}
         self.last_rejection: dict[str, str | int] | None = None
 
@@ -98,6 +104,7 @@ class Transport:
             "bytes_last_30s": sum(size for stamp, size in self.byte_history if stamp > time.monotonic() - 30),
             "proxied": self.proxied,
             "remote_budgets": self.remote_budgets,
+            "rate_limit_fallback_s": self.rate_limit_fallback_s,
             "last_rejection": self.last_rejection,
         }
 
@@ -176,6 +183,7 @@ class Transport:
                             request=received.request,
                         )
             except httpx.HTTPError:
+                admission.record_failure()
                 if writes:
                     raise UnknownOutcome("Network error after mutation submission") from None
                 if attempt == 2:
@@ -197,14 +205,23 @@ class Transport:
             if response.status_code >= 500 or response.status_code == 429:
                 delay = retry_after_seconds(response.headers.get("Retry-After"))
                 if delay is None:
-                    delay = (1 if response.status_code == 429 else 0.25) * 2**attempt
+                    delay = (
+                        self.rate_limit_fallback_s
+                        if response.status_code == 429
+                        and reset_delay <= 0
+                        and self.rate_limit_fallback_s is not None
+                        else (1 if response.status_code == 429 else 0.25) * 2**attempt
+                    )
                 if response.status_code == 429:
                     delay = max(delay, reset_delay)
-                admission.defer(delay + random.uniform(0, min(0.1, delay * 0.1)))
+                paced_delay = delay + random.uniform(0, min(0.1, delay * 0.1))
                 if response.status_code == 429:
                     self.responses_429 += 1
                     admission.responses_429 += 1
-                    admission.slow_down()
+                    admission.rate_limit_backoff(paced_delay)
+                else:
+                    admission.record_failure()
+                    admission.defer(paced_delay)
                 event(
                     "http_backoff",
                     level="WARNING",
@@ -236,10 +253,13 @@ class Transport:
                     **detail,
                 )
             if not response.content:
+                admission.record_success()
                 return None
             try:
-                return response.json()
+                result = response.json()
             except ValueError:
                 cls = UnknownOutcome if writes else RemoteError
                 raise cls("Invalid JSON response") from None
+            admission.record_success()
+            return result
         raise RemoteError("Read attempts exhausted")

@@ -74,7 +74,7 @@ async def test_jupiter_reset_header_defers_all_main_requests_and_preserves_execu
         await jup.close()
 
 
-async def test_429_uses_absolute_reset_as_well_as_retry_after(caplog):
+async def test_429_uses_absolute_reset_as_well_as_retry_after(caplog, monkeypatch):
     seen = []
 
     def handler(request):
@@ -96,6 +96,8 @@ async def test_429_uses_absolute_reset_as_well_as_retry_after(caplog):
         client=httpx.AsyncClient(base_url="https://api.jup.ag", transport=httpx.MockTransport(handler)),
         rate_headers=True,
     )
+    # Match runtime logging: this explicit handler must not also receive root propagation.
+    monkeypatch.setattr(LOGGER, "propagate", False)
     LOGGER.addHandler(caplog.handler)
     try:
         await t.request("GET", "/price")

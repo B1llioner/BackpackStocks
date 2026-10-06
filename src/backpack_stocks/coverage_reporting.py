@@ -35,6 +35,27 @@ def format_forward_coverage(snapshot: dict) -> list[str]:
         coverage["waiting"],
         coverage["unverified"],
     )
+    indicative_mode = coverage.get("quote_source") == "indicative"
+    split_sources = indicative_mode or any(
+        key in coverage for key in ("indicative_pricedfresh", "rfq_pricedfresh")
+    )
+    indicative, baseline_rfq, confirmed = 0, 0, 0
+    if split_sources:
+        indicative, baseline_rfq = (
+            coverage.get("indicative_pricedfresh", -1),
+            coverage.get("rfq_pricedfresh", -1),
+        )
+        confirmed = (
+            snapshot["rfq_confirmed_calculations"]
+            if "rfq_confirmed_calculations" in snapshot
+            else baseline_rfq
+        )
+        if (
+            any(type(value) is not int or value < 0 for value in (indicative, baseline_rfq, confirmed))
+            or indicative + baseline_rfq != priced
+            or confirmed > eligible * 2
+        ):
+            return ["BP → DEX: сведения о проходе пока недоступны."]
     known_blocks = coverage.get("known_blocks", 0)
     if (
         universe != eligible + unverified
@@ -63,11 +84,29 @@ def format_forward_coverage(snapshot: dict) -> list[str]:
         f"BP → DEX · первичный проход {completed}/{eligible} допустимых"
         + (" · завершён" if done else " · продолжается"),
         "Минимальная законная партия; результат относится только к этому объёму.",
-        f"Сейчас из {universe}: свежие пары BP+DEX {priced}; отказ BP {refused}; "
-        f"ожидают расчёта {awaiting}; закрыта сессия / несовместима партия {known_blocks}; "
-        f"неподтверждены {unverified}.",
-        f"Действующая проверка BP: {coverage['checked']}/{eligible}; отказ не даёт численной пары.",
     ]
+    if split_sources:
+        lines.append(
+            f"Покрытие BP → DEX: свежие индикативные расчёты {indicative}; "
+            f"отдельные расчёты с подтверждённой RFQ {confirmed}."
+        )
+    lines.extend(
+        [
+            f"Сейчас из {universe}: свежие пары BP+DEX {priced}; "
+            + (f"нет текущей котировки Backpack {refused}; " if indicative_mode else f"отказ BP {refused}; ")
+            + f"ожидают расчёта {awaiting}; закрыта сессия / несовместима партия {known_blocks}; "
+            f"неподтверждены {unverified}.",
+            f"Свежие котировки покупки Backpack: {coverage['checked']}/{eligible}; "
+            "отсутствие котировки не даёт численной пары."
+            if indicative_mode
+            else f"Действующая проверка BP: {coverage['checked']}/{eligible}; отказ не даёт численной пары.",
+        ]
+    )
+    if indicative_mode:
+        lines.append(
+            "Положительный net по публичной котировке требует подтверждения RFQ "
+            "на выбранный объём перед входом."
+        )
     pending, waitingbank, missing = (
         coverage.get("pending"),
         coverage.get("waitingbank"),
@@ -82,7 +121,13 @@ def format_forward_coverage(snapshot: dict) -> list[str]:
         lines.append(f"Без попытки или установленной причины: {coverage['unattempted']}/{eligible}.")
     lines.append(
         "Свежесть цены: "
-        + _freshness("BP", snapshot.get("backpack_price_ttl_s"))
+        + (
+            _freshness("публичная BP", snapshot.get("indicative_quote_ttl_s"))
+            + "; "
+            + _freshness("RFQ", snapshot.get("backpack_price_ttl_s"))
+            if indicative_mode
+            else _freshness("BP", snapshot.get("backpack_price_ttl_s"))
+        )
         + "; "
         + _freshness("DEX", snapshot.get("dex_bank_ttl_s"))
         + "."

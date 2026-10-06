@@ -15,6 +15,10 @@ class PriorityLimiter:
         self.interval, self.last = interval, 0.0
         self.base_interval = interval
         self.adaptive_backoffs = 0
+        self.adaptive_recoveries = 0
+        self._rate_limit_until = 0.0
+        self._recovery_at = 0.0
+        self._successful_responses = 0
         self.categories = categories or {}
         self.oldest_every = oldest_every
         self.category_last: dict[str, float] = {}
@@ -47,10 +51,41 @@ class PriorityLimiter:
 
     def configure(self, interval: float) -> None:
         self.base_interval = self.interval = interval
+        self._successful_responses = 0
+
+    def record_failure(self) -> None:
+        self._recovery_at = time.monotonic()
+        self._successful_responses = 0
 
     def slow_down(self) -> None:
+        self.record_failure()
         self.interval = max(self.interval, min(30, max(0.25, self.interval * 1.5)))
         self.adaptive_backoffs += 1
+
+    def rate_limit_backoff(self, delay: float) -> None:
+        """One slowdown per cooldown episode; every response extends its wait."""
+        now = time.monotonic()
+        if now < self._rate_limit_until:
+            self.record_failure()
+        else:
+            self.slow_down()
+        self.defer(delay)
+        self._rate_limit_until = max(self._rate_limit_until, self.blocked_until, now + self.interval)
+
+    def record_success(self) -> None:
+        """Recover gradually after a quiet window, without relaxing server budgets."""
+        if self.interval <= self.base_interval:
+            return
+        now = time.monotonic()
+        if now < max(self.blocked_until, max(self.category_blocked.values(), default=0)):
+            return
+        self._successful_responses = min(8, self._successful_responses + 1)
+        if now - self._recovery_at < 30 or self._successful_responses < 8:
+            return
+        self.interval = max(self.base_interval, self.interval / 1.5)
+        self.adaptive_recoveries += 1
+        self._successful_responses = 0
+        self._recovery_at = now
 
     def ready_at(self, category: str | None) -> float:
         return max(
@@ -107,6 +142,7 @@ class PriorityLimiter:
             "base_interval_s": self.base_interval,
             "oldest_every": self.oldest_every,
             "adaptive_backoffs": self.adaptive_backoffs,
+            "adaptive_recoveries": self.adaptive_recoveries,
             "categories_s": self.categories,
             "cooldown_s": max(0, self.blocked_until - time.monotonic()),
             "category_cooldown_s": {

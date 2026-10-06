@@ -237,6 +237,11 @@ def status_text(engine: Engine) -> str:
         from .monitor import session_text
 
         snapshot = engine.monitor.snapshot()
+        refresh = (
+            "Публичные BP limit-котировки поступают раз в секунду; положительный кол требует своего RFQ. "
+            if snapshot.get("forward_coverage", {}).get("quote_source") == "indicative"
+            else f"Доступность RFQ проверяется каждые {engine.settings.monitor.rfq_cache_s:g}с; "
+        )
         text = (
             f"Режим: {engine.settings.mode} · монитор {snapshot['universe']} акций\n"
             "Объём: автоподбор без потолка USDC\n"
@@ -244,7 +249,7 @@ def status_text(engine: Engine) -> str:
             f"стаканы для расчёта: {snapshot.get('spot_supported_assets', 0)}/{snapshot.get('spot_markets', 0)}; "
             f"свежих котировок: {snapshot['fresh_quotes']}; "
             f"сигналов сейчас: {snapshot.get('signal_candidates', snapshot['candidates'])}\n"
-            f"RFQ обновляется каждые {engine.settings.monitor.rfq_cache_s:g}с; "
+            f"{refresh}"
             f"стаканы каждые {engine.settings.monitor.spot_refresh_s:g}с; "
             f"срок свежести {engine.settings.monitor.max_quote_age_s:g}с."
             "\nПроверяются BP → Jupiter и Jupiter → BP. Обратная продажа требует зачисления акции на BP."

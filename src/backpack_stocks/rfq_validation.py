@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from .backpack import Backpack
 from .models import dec
 from .observability import error_code, event
+from .rfq_query_batch import RfqQueryBatch
 from .transport import RemoteError
 
 SIZE_REFUSALS = {"rfq_insufficient_balance", "rfq_invalid_quantity", "rfq_no_quote"}
@@ -34,6 +35,7 @@ class RfqCheck:
     retry_at: float
     eligibility_until: float
     price: str | None = None
+    source: Literal["rfq", "indicative"] = "rfq"
 
     def usable(self, now: float) -> bool:
         return self.state == "available" and self.checked_at <= now < self.retry_at
@@ -52,6 +54,7 @@ class RfqCheck:
             "checked_at": self.checked_at,
             "retry_at": self.eligibility_until,
             "price_expires_at": self.retry_at if self.price else None,
+            "source": self.source,
         }
 
 
@@ -75,6 +78,7 @@ class RfqValidator:
         # Avoid opening competing requests for the same stock; also bound account traffic.
         self.locks: dict[str, asyncio.Lock] = {}
         self.limit = asyncio.Semaphore(concurrency)
+        self.query_batch = RfqQueryBatch(backpack, clock=clock) if type(backpack) is Backpack else None
 
     def invalidate(self, symbol: str) -> None:
         self.cache = {k: v for k, v in self.cache.items() if k[0] != symbol}
@@ -121,6 +125,11 @@ class RfqValidator:
                 return cached
             blocked = self.blocked(symbol, session, side)
             if blocked and not (blocked.reason in SIZE_REFUSALS and dec(blocked.quantity) != dec(quantity)):
+                if blocked.state == "unknown" and dec(blocked.quantity) != dec(quantity):
+                    # This shared transport pause has no price or size evidence.
+                    # Preserve its original deadlines without returning another
+                    # request's quantity as an exact RFQ response.
+                    return replace(blocked, quantity=quantity)
                 return blocked
             if self.backpack.auth is None:
                 result = self.result(symbol, side, quantity, session, "unknown", "rfq_auth_required")
@@ -150,8 +159,10 @@ class RfqValidator:
             )
             return result
 
-    def result(self, symbol, side, quantity, session, state, reason, price=None) -> RfqCheck:
-        now = self.clock()
+    def result(
+        self, symbol, side, quantity, session, state, reason, price=None, *, observed_at=None
+    ) -> RfqCheck:
+        now = self.clock() if observed_at is None else observed_at
         eligibility_ttl = min(self.retry_s, self.cache_s) if state == "unavailable" else self.cache_s
         ttl = min(self.max_age, eligibility_ttl) if state == "available" else eligibility_ttl
         return RfqCheck(
@@ -184,8 +195,12 @@ class RfqValidator:
                 expiry = float(rfq["expiryTime"]) / 1000
                 if not self.clock() < expiry <= self.clock() + 60:
                     return self.result(symbol, side, quantity, session, "unknown", "rfq_expired_before_check")
+                registered = self.query_batch.register() if self.query_batch else None
                 while self.clock() < expiry:
-                    records = await self.backpack.rfqs(rfq_id, symbol=market)
+                    if self.query_batch and registered is not None:
+                        records, observed_at = await self.query_batch.query(rfq_id, market, registered)
+                    else:
+                        records, observed_at = await self.backpack.rfqs(rfq_id, symbol=market), self.clock()
                     if self.clock() >= expiry:
                         break
                     for record in records:
@@ -209,7 +224,14 @@ class RfqValidator:
                         if prices:
                             price = str(min(prices) if side == "Bid" else max(prices))
                             return self.result(
-                                symbol, side, quantity, session, "available", "rfq_quote_observed", price
+                                symbol,
+                                side,
+                                quantity,
+                                session,
+                                "available",
+                                "rfq_quote_observed",
+                                price,
+                                observed_at=observed_at,
                             )
                     await asyncio.sleep(min(0.25, max(0, expiry - self.clock())))
                 return self.result(symbol, side, quantity, session, "unavailable", "rfq_no_quote")

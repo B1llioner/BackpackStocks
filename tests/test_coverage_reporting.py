@@ -169,3 +169,66 @@ def test_empty_universe_does_not_claim_a_completed_pass():
         )
     )
     assert "завершён" not in text
+
+
+def test_public_coverage_and_account_rfq_confirmation_are_labeled_separately():
+    snapshot = report(
+        quote_source="indicative",
+        indicative_pricedfresh=1,
+        rfq_pricedfresh=0,
+        rows=[{"asset": "POS.US", "state": "fresh_priced", "quote_source": "indicative", "profit_raw": 100}],
+    )
+    snapshot.update(indicative_quote_ttl_s=15, rfq_confirmed_calculations=0)
+    before = deepcopy(snapshot)
+    text = "\n".join(format_forward_coverage(snapshot))
+    assert "свежие индикативные расчёты 1; отдельные расчёты с подтверждённой RFQ 0" in text
+    assert "свежие пары BP+DEX 1; нет текущей котировки Backpack 1" in text
+    assert "Свежие котировки покупки Backpack: 3/4" in text
+    assert "Положительный net по публичной котировке требует подтверждения RFQ на выбранный объём" in text
+    assert "отказ BP" not in text and "Действующая проверка BP" not in text
+    assert snapshot == before
+
+
+def test_confirmed_primary_calculations_do_not_inflate_public_minimum_coverage():
+    snapshot = report(quote_source="indicative", indicative_pricedfresh=1, rfq_pricedfresh=0)
+    snapshot["rfq_confirmed_calculations"] = 2
+    text = "\n".join(format_forward_coverage(snapshot))
+    assert "свежие индикативные расчёты 1; отдельные расчёты с подтверждённой RFQ 2" in text
+    assert "свежие пары BP+DEX 1" in text
+    assert "свежие пары BP+DEX 3" not in text
+
+
+def test_explicit_baseline_rfq_count_is_used_when_primary_count_is_absent():
+    snapshot = report(quote_source="indicative", indicative_pricedfresh=0, rfq_pricedfresh=1)
+    text = "\n".join(format_forward_coverage(snapshot))
+    assert "свежие индикативные расчёты 0; отдельные расчёты с подтверждённой RFQ 1" in text
+
+
+def test_public_and_rfq_freshness_limits_are_separate_and_never_invented():
+    snapshot = report(quote_source="indicative", indicative_pricedfresh=1, rfq_pricedfresh=0)
+    snapshot["indicative_quote_ttl_s"] = 6.5
+    text = "\n".join(format_forward_coverage(snapshot))
+    assert "публичная BP до 6.5с; RFQ до 15с; DEX до 8с" in text
+    snapshot.pop("indicative_quote_ttl_s")
+    text = "\n".join(format_forward_coverage(snapshot))
+    assert "публичная BP: срок не указан; RFQ до 15с; DEX до 8с" in text
+
+
+@pytest.mark.parametrize(
+    "updates,confirmed",
+    [
+        ({"indicative_pricedfresh": 2, "rfq_pricedfresh": 0}, 0),
+        ({"indicative_pricedfresh": True, "rfq_pricedfresh": 0}, 0),
+        ({"indicative_pricedfresh": 1, "rfq_pricedfresh": -1}, 0),
+        ({"indicative_pricedfresh": 1}, 0),
+        ({"indicative_pricedfresh": 1, "rfq_pricedfresh": 0}, True),
+        ({"indicative_pricedfresh": 1, "rfq_pricedfresh": 0}, -1),
+        ({"indicative_pricedfresh": 1, "rfq_pricedfresh": 0}, 9),
+    ],
+)
+def test_invalid_source_counts_cannot_claim_public_or_confirmed_coverage(updates, confirmed):
+    snapshot = report(quote_source="indicative", **updates)
+    snapshot["rfq_confirmed_calculations"] = confirmed
+    text = "\n".join(format_forward_coverage(snapshot))
+    assert "сведения о проходе пока недоступны" in text
+    assert "подтверждённой RFQ" not in text and "свежие пары" not in text

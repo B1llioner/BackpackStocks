@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from .feed import StockFeed
+from .indicative_feed import IndicativeFeed
 from .models import Observation, dec
 from .transport import Transport
 
@@ -62,12 +63,20 @@ class Backpack:
         ws_proxy: str | None = None,
     ):
         self.auth = auth
-        self.http = transport or Transport("https://api.backpack.exchange", interval=interval, proxy=proxy)
+        self.http = transport or Transport(
+            "https://api.backpack.exchange",
+            interval=interval,
+            proxy=proxy,
+            rate_headers=True,
+            rate_limit_fallback_s=60,
+        )
         self.http.limiter.categories["historical_market_data"] = 2.05
         self.stock_feed = StockFeed(proxy=proxy if ws_proxy is None else ws_proxy)
+        self.indicative_feed = IndicativeFeed(proxy=proxy if ws_proxy is None else ws_proxy)
 
     async def close(self) -> None:
         await self.stock_feed.close()
+        await self.indicative_feed.close()
         await self.http.close()
 
     async def public(self, path: str, **params: Any) -> Any:
@@ -174,7 +183,7 @@ class Backpack:
             autoBorrowRepay=False,
         )
 
-    async def rfqs(self, rfq_id: str | None = None, *, symbol: str = "WEN.US_USDC_RFQ") -> list[dict]:
+    async def rfqs(self, rfq_id: str | None = None, *, symbol: str | None = "WEN.US_USDC_RFQ") -> list[dict]:
         return await self.private("GET", "/api/v1/rfqs", "rfqQuery", rfqId=rfq_id, symbol=symbol)
 
     async def accept_rfq(self, rfq_id: str, quote_id: str) -> dict:

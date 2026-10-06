@@ -18,6 +18,7 @@ from solders.pubkey import Pubkey
 
 from .backpack import Backpack
 from .coverage_reporting import format_forward_coverage
+from .indicative_feed import IndicativeFeed, IndicativeUnavailable
 from .jupiter import Jupiter
 from .jupiter_flow_quotes import JupiterFlowQuotes
 from .models import STOCK_MINT, USDC_MINT, Observation, Settings, dec, floor_step, impact_percent, raw, ui
@@ -71,6 +72,14 @@ BLOCK_LABELS = {
     "rfq_check_pending": "доступность покупки RFQ ещё не проверена",
     "rfq_sell_check_pending": "доступность продажи RFQ ещё не проверена",
     "rfq_budget_changed": "RFQ не укладывается в бюджет",
+    "indicative_quote_pending": "ожидает публичной котировки Backpack",
+    "indicative_requires_rfq": "публичная цена: требуется RFQ на точный объём",
+    "indicative_quantity_mismatch": "ограничения публичной котировки отличаются от метаданных",
+    "stock_indicative_unavailable": "нет текущей публичной котировки Backpack",
+    "indicative_stalePrice": "источник цены Backpack устарел",
+    "indicative_noActiveSession": "нет открытой сессии Backpack",
+    "indicative_quoterUnavailable": "котировщик Backpack недоступен",
+    "indicative_quote_stale": "публичная котировка Backpack устарела",
     "budget_below_minimum_lot": "минимальный лот дороже лимита",
     "below_withdrawal_minimum": "объём ниже минимума вывода",
     "nonpositive_net": "нет положительного net после расходов",
@@ -273,6 +282,13 @@ class SpreadMonitor:
             concurrency=config.rfq_concurrency,
             clock=clock,
         )
+        # The public quoter stream covers the paper universe without opening
+        # hundreds of account RFQs. Positive calls still need an exact RFQ.
+        self.indicative_feed: IndicativeFeed | None = (
+            backpack.indicative_feed
+            if type(backpack) is Backpack and settings.mode == "paper" and self.forward_coverage_enabled
+            else None
+        )
 
     @property
     def quote_provider(self) -> Jupiter | JupiterFlowQuotes | DirectRaydium:
@@ -357,6 +373,8 @@ class SpreadMonitor:
                 self.books.discover([], set())
                 event("stock_markets_error", component="backpack_spot", code=error_code(error))
         await self.backpack.stock_feed.subscribe([a.ticker for a in entries])
+        if self.indicative_feed is not None:
+            await self.indicative_feed.subscribe([a.ticker for a in entries])
         self.discovery_ready.set()
 
     async def refresh_prices(self) -> None:
@@ -393,6 +411,19 @@ class SpreadMonitor:
         self.prices, self.prices_at = prices, self.clock()
 
     def observation(self, asset: Asset) -> Observation:
+        if self.indicative_feed is not None:
+            try:
+                state = self.coverage_state(asset)
+                check = self.indicative_check(asset, state.quantity_raw, state.session)
+                observation = self.check_observation(check)
+                try:
+                    sale = self.indicative_check(asset, state.quantity_raw, state.session, side="Ask")
+                    observation = observation.model_copy(update={"bid": sale.price})
+                except (ValueError, KeyError, TypeError, ArithmeticError):
+                    pass
+                return observation
+            except (ValueError, KeyError, TypeError, ArithmeticError):
+                pass
         latest = self.backpack.stock_feed.latest.get(asset.ticker)
         if latest and -2 <= self.clock() - latest.timestamp <= self.settings.policy.quote_max_age_s:
             return latest
@@ -577,6 +608,12 @@ class SpreadMonitor:
             or dec(check.price or "0") <= 0
         ):
             raise RfqUnavailable("rfq_check_stale")
+        return self.check_observation(check)
+
+    @staticmethod
+    def check_observation(check: RfqCheck) -> Observation:
+        if not check.price:
+            raise RfqUnavailable(check.reason)
         return Observation(
             ask=check.price,
             # Only the purchase ask was observed. Empty bid is unavailable,
@@ -584,8 +621,83 @@ class SpreadMonitor:
             bid="",
             timestamp=check.checked_at,
             session=check.session,
-            source="Backpack AwaitAccept RFQ; cancelled after inspection",
+            source="Backpack stockIndicativeQuote limit; requires own RFQ"
+            if check.source == "indicative"
+            else "Backpack AwaitAccept RFQ; cancelled after inspection",
         )
+
+    def indicative_check(
+        self, asset: Asset, quantity_raw: int, session: str, *, side: str = "Bid"
+    ) -> RfqCheck:
+        assert self.indicative_feed is not None
+        quantity = str(ui(quantity_raw, asset.decimals))
+        quote = self.indicative_feed.get(
+            asset.ticker,
+            side,
+            quantity,
+            session,
+            max_age=self.settings.monitor.max_quote_age_s,
+            now=self.clock(),
+        )
+        rules = self.coverage_rules(asset)[1]
+        if any(
+            dec(quote.quantity_rules[k]) != dec(rules[k]) for k in ("minQuantity", "maxQuantity", "stepSize")
+        ):
+            raise RfqUnavailable("indicative_quantity_mismatch")
+        stamp = quote.published_at
+        expiry = stamp + self.settings.monitor.max_quote_age_s
+        return RfqCheck(
+            asset.symbol,
+            side,
+            quantity,
+            session,
+            "available",
+            "indicative_quote_observed",
+            stamp,
+            expiry,
+            expiry,
+            quote.price,
+            source="indicative",
+        )
+
+    def sync_indicative_coverage(self, state: ForwardCoverage) -> None:
+        if self.indicative_feed is None:
+            return
+        try:
+            state.check = self.indicative_check(state.asset, state.quantity_raw, state.session)
+            if state.reason and state.reason.startswith(("indicative_", "stock_indicative_")):
+                state.reason = None
+        except (IndicativeUnavailable, RfqUnavailable) as error:
+            latest = self.indicative_feed.latest.get(state.asset.ticker)
+            stamp = latest.published_at if latest else 0
+            expiry = stamp + self.settings.monitor.max_quote_age_s
+            provider_unavailable = bool(
+                latest
+                and 0 <= self.clock() - stamp < self.settings.monitor.max_quote_age_s
+                and stamp <= latest.received_at <= self.clock()
+                and latest.reason
+                and latest.reason not in {"indicative_invalid_payload", "indicative_invalid_reason"}
+            )
+            state.check = RfqCheck(
+                state.asset.symbol,
+                "Bid",
+                str(ui(state.quantity_raw, state.asset.decimals)),
+                state.session,
+                "unavailable" if provider_unavailable else "unknown",
+                error.code,
+                stamp,
+                expiry,
+                expiry,
+                source="indicative",
+            )
+            if state.check.state == "unavailable" and not state.attempted_at:
+                state.attempted_at = self.clock()
+            state.reason = (
+                (error.reason if error.reason.startswith("indicative_") else "indicative_" + error.reason)
+                if isinstance(error, IndicativeUnavailable)
+                else error.code
+            )
+            state.completed = state.completed or state.check.state == "unavailable"
 
     def coverage_state(self, asset: Asset) -> ForwardCoverage:
         """Own one legal minimum Bid, independently of the size search cache."""
@@ -618,6 +730,7 @@ class SpreadMonitor:
         check = state.check if state and state.asset == asset and side == "Bid" else None
         if (
             check
+            and check.source == "rfq"
             and check.symbol == asset.symbol
             and check.side == side
             and check.session == session
@@ -631,6 +744,18 @@ class SpreadMonitor:
         self, asset: Asset, *, refresh: bool = False
     ) -> tuple[int, int, Observation, RfqCheck, None]:
         state = self.coverage_state(asset)
+        if self.indicative_feed is not None:
+            self.sync_indicative_coverage(state)
+            check = state.check
+            if check is None or not check.usable(self.clock()):
+                raise RfqUnavailable(check.reason if check else "indicative_quote_pending")
+            return (
+                state.quantity_raw,
+                state.quantity_raw - raw(asset.fee, asset.decimals),
+                self.coverage_observation(asset, check),
+                check,
+                None,
+            )
         previous = state.check
         quantity = str(ui(state.quantity_raw, asset.decimals))
         check = None if refresh else self.exact_rfq(asset, quantity, state.session)
@@ -680,7 +805,12 @@ class SpreadMonitor:
                 and row["acquired_raw"] == state.quantity_raw
                 and check.session == row["backpack_session"]
                 and dec(check.quantity) == ui(row["acquired_raw"], state.asset.decimals)
-                and check.checked_at == row["backpack_timestamp"]
+                and (
+                    check.checked_at == row["backpack_timestamp"]
+                    or check.source == "indicative"
+                    and 0 <= now - row["backpack_timestamp"] <= self.settings.monitor.max_quote_age_s
+                )
+                and row.get("backpack_source", "rfq") == check.source
                 and dec(check.price or "0") == dec(row["backpack_price"])
                 and (
                     not isinstance(self.quote_provider, DirectRaydium)
@@ -736,6 +866,9 @@ class SpreadMonitor:
                 }
                 continue
             check = state.check
+            if self.indicative_feed is not None:
+                self.sync_indicative_coverage(state)
+                check = state.check
             if check and check.state != "available" and now < check.eligibility_until:
                 continue
             if now < state.retry_at or (
@@ -1010,6 +1143,7 @@ class SpreadMonitor:
                     continue
                 if (
                     config.rfq_validation
+                    and not (self.indicative_feed is not None and direction == FORWARD)
                     and not spot
                     and self.rfq.blocked(asset.symbol, session, "Bid" if direction == FORWARD else "Ask")
                     and not (direction == FORWARD and size_probe)
@@ -1017,6 +1151,7 @@ class SpreadMonitor:
                     continue
                 if (
                     config.rfq_validation
+                    and not (self.indicative_feed is not None and direction == FORWARD)
                     and not spot
                     and not self.rfq_ready(asset, session, direction)
                     and not (direction == FORWARD and size_probe)
@@ -1137,6 +1272,9 @@ class SpreadMonitor:
         raise RfqUnavailable("rfq_budget_changed")
 
     def rfq_cooldown(self, asset: Asset, direction: str) -> bool:
+        if self.indicative_feed is not None and direction == FORWARD:
+            # Account inspection failures gate confirmation, not public screening.
+            return False
         if self.books.available(asset.symbol):
             return False
         if not self.settings.monitor.rfq_validation:
@@ -1312,6 +1450,9 @@ class SpreadMonitor:
     async def rfq_loop(self) -> None:
         """Refresh due sides fairly; only owned available plans use price deadlines."""
         await self.discovery_ready.wait()
+        if self.indicative_feed is not None:
+            await self.confirmed_rfq_loop()
+            return
         if not self.forward_coverage_enabled:
             await self.refresh_external_prices()
         pending: dict[tuple[str, str], asyncio.Task] = {}
@@ -1372,6 +1513,71 @@ class SpreadMonitor:
                 task.cancel()
             await asyncio.gather(*pending.values(), return_exceptions=True)
 
+    async def confirmed_rfq_loop(self) -> None:
+        """Renew only confirmed positive plans; baseline prices arrive over WS."""
+        pending: dict[tuple[str, str], asyncio.Task] = {}
+
+        async def renew(key: tuple[str, str], plan: dict) -> None:
+            check = await self.confirm_local_price(key, plan, force_refresh=True)
+            if check:
+                side = "Bid" if key[1] == FORWARD else "Ask"
+                self.rfq_after[(key[0], side)] = (
+                    check.checked_at + (check.retry_at - check.checked_at) * 2 / 3
+                    if check.state == "available"
+                    else check.eligibility_until
+                )
+            self.updated.set()
+
+        try:
+            while True:
+                for key, task in list(pending.items()):
+                    if task.done():
+                        try:
+                            await task
+                        except (ValueError, KeyError, TypeError):
+                            self.rfq_after[(key[0], "Bid" if key[1] == FORWARD else "Ask")] = (
+                                self.clock() + self.settings.monitor.rfq_retry_s
+                            )
+                        pending.pop(key)
+                for key, plan in sorted(self.local_plans.items()):
+                    if len(pending) >= min(2, self.settings.monitor.rfq_concurrency):
+                        break
+                    if (
+                        key in pending
+                        or plan.get("backpack_source") != "rfq"
+                        or plan.get("profit_raw", 0) <= 0
+                    ):
+                        continue
+                    side = "Bid" if key[1] == FORWARD else "Ask"
+                    deadline = (
+                        plan["backpack_timestamp"]
+                        + (plan["backpack_rfq_valid_until"] - plan["backpack_timestamp"]) * 2 / 3
+                    )
+                    if self.clock() >= max(deadline, self.rfq_after.get((key[0], side), 0)):
+                        pending[key] = asyncio.create_task(renew(key, dict(plan)))
+                if len(pending) < min(2, self.settings.monitor.rfq_concurrency):
+                    for asset in sorted(
+                        self.assets.values(), key=lambda row: self.rfq_after.get((row.symbol, "Ask"), 0)
+                    ):
+                        key = asset.symbol, REVERSE
+                        if key in pending or not asset.deposit_enabled or self.books.available(asset.symbol):
+                            continue
+                        if self.chain.get(asset.symbol) != "verified_unit_mapping":
+                            continue
+                        previous = self.rfq.latest.get((asset.symbol, "Ask"))
+                        deadline = max(
+                            self.rfq_after.get((asset.symbol, "Ask"), 0),
+                            previous.eligibility_until if previous else 0,
+                        )
+                        if self.clock() >= deadline:
+                            pending[key] = asyncio.create_task(self.refresh_rfq_asset(asset, "Ask"))
+                            break
+                await asyncio.sleep(0.25)
+        finally:
+            for task in pending.values():
+                task.cancel()
+            await asyncio.gather(*pending.values(), return_exceptions=True)
+
     def owned_bid_renewal(self, symbol: str, side: str) -> bool:
         state = self.forward_coverage.get(symbol)
         return bool(
@@ -1414,12 +1620,16 @@ class SpreadMonitor:
             except Exception as error:
                 failures.append(error)
         try:
-            obs = self.rfq_observation(asset)
+            obs = self.observation(asset) if self.indicative_feed is not None else self.rfq_observation(asset)
             session = self.quantity_session(obs)
             blocked = self.rfq.blocked(asset.symbol, session)
             if blocked and candidates:
                 raise RfqUnavailable(blocked.reason)
-            if self.settings.monitor.rfq_validation:
+            if self.indicative_feed is not None:
+                acquired, delivered = self.sizing(asset, obs, notional=budget)
+                check = self.indicative_check(asset, acquired, session)
+                obs = self.check_observation(check)
+            elif self.settings.monitor.rfq_validation:
                 acquired, delivered, obs, check = await self.validated_buy(asset, obs, notional=budget)
             else:
                 acquired, delivered = self.sizing(asset, obs, notional=budget)
@@ -1486,6 +1696,12 @@ class SpreadMonitor:
             if not capacity or not self.books.capacity_valid(asset.symbol, fill, capacity.checked_at):
                 raise LocalQuoteNotReady()
             check = None
+        elif plan["backpack_source"] == "indicative":
+            check = self.indicative_check(asset, acquired, self.coverage_rules(asset)[0])
+            if plan.get("minimum_coverage"):
+                self.forward_coverage[asset.symbol].check = check
+            obs = self.check_observation(check)
+            fill = None
         else:
             obs = (
                 self.coverage_observation(asset)
@@ -1547,7 +1763,9 @@ class SpreadMonitor:
         )
         return sellable, obs, check, None, proceeds
 
-    async def confirm_local_price(self, key: tuple[str, str], plan: dict) -> RfqCheck | None:
+    async def confirm_local_price(
+        self, key: tuple[str, str], plan: dict, *, force_refresh: bool = False
+    ) -> RfqCheck | None:
         """Renew a plan's exact side and size through the fair RFQ queue."""
         from .direct import DirectRaydium
 
@@ -1600,10 +1818,20 @@ class SpreadMonitor:
             side="Bid" if forward else "Ask",
         )
         check = await self.rfq.check(
-            asset.symbol, str(ui(quantity, asset.decimals)), session, side="Bid" if forward else "Ask"
+            asset.symbol,
+            str(ui(quantity, asset.decimals)),
+            session,
+            side="Bid" if forward else "Ask",
+            force_refresh=force_refresh,
         )
         coverage = self.forward_coverage.get(asset.symbol)
-        if forward and coverage and coverage.asset == asset and coverage.quantity_raw == quantity:
+        if (
+            self.indicative_feed is None
+            and forward
+            and coverage
+            and coverage.asset == asset
+            and coverage.quantity_raw == quantity
+        ):
             coverage.check = check
         return check
 
@@ -1667,6 +1895,9 @@ class SpreadMonitor:
                 # Ask quantity is determined by the newly repriced DEX output;
                 # local_sell still requires that exact quantity after repricing.
                 source_version = tuple(sorted(exact))
+            elif plan["backpack_source"] == "indicative" and self.indicative_feed is not None:
+                check = self.indicative_check(asset, plan["acquired_raw"], self.coverage_rules(asset)[0])
+                source_version = (check.checked_at, check.price)
             else:
                 return None
             return tuple(current), source_version
@@ -1846,28 +2077,32 @@ class SpreadMonitor:
             if self.quantity_session(obs) != obs.session and rfq_check:
                 raise RfqUnavailable("rfq_session_unavailable")
             if direction == FORWARD and rfq_check and not rfq_check.usable(self.clock()):
-                if local_plan is not None:
-                    from .direct import LocalQuoteNotReady
+                if rfq_check.source == "indicative":
+                    rfq_check = self.indicative_check(asset, acquired, self.quantity_session(obs))
+                    obs = self.check_observation(rfq_check)
+                    if coverage_state:
+                        coverage_state.check = rfq_check
+                else:
+                    if local_plan is not None:
+                        from .direct import LocalQuoteNotReady
 
-                    raise LocalQuoteNotReady()
-                # Route discovery can outlive a short RFQ. Refresh exactly the
-                # bought quantity; resizing here would invalidate the DEX input.
-                rfq_check = await self.rfq.check(
-                    symbol, str(ui(acquired, asset.decimals)), self.quantity_session(obs)
-                )
-                if coverage_state:
-                    if (
-                        rfq_check.session != coverage_state.session
-                        or rfq_check.side != "Bid"
-                        or dec(rfq_check.quantity) != ui(acquired, asset.decimals)
-                    ):
-                        raise RfqUnavailable("rfq_response_mismatch")
-                    coverage_state.check = rfq_check
-                    if rfq_check.state == "unavailable":
-                        coverage_state.completed = True
-                if not rfq_check.usable(self.clock()):
-                    raise RfqUnavailable(rfq_check.reason)
-                obs = obs.model_copy(update={"ask": rfq_check.price, "timestamp": rfq_check.checked_at})
+                        raise LocalQuoteNotReady()
+                    rfq_check = await self.rfq.check(
+                        symbol, str(ui(acquired, asset.decimals)), self.quantity_session(obs)
+                    )
+                    if coverage_state:
+                        if (
+                            rfq_check.session != coverage_state.session
+                            or rfq_check.side != "Bid"
+                            or dec(rfq_check.quantity) != ui(acquired, asset.decimals)
+                        ):
+                            raise RfqUnavailable("rfq_response_mismatch")
+                        coverage_state.check = rfq_check
+                        if rfq_check.state == "unavailable":
+                            coverage_state.completed = True
+                    if not rfq_check.usable(self.clock()):
+                        raise RfqUnavailable(rfq_check.reason)
+                    obs = obs.model_copy(update={"ask": rfq_check.price, "timestamp": rfq_check.checked_at})
             quoted_output = int(quote["outAmount"])
             reserved_output = quoted_output * (10000 - p.slippage_bps) // 10000
             provider_minimum = int(quote.get("otherAmountThreshold", quoted_output))
@@ -1908,6 +2143,36 @@ class SpreadMonitor:
                     else await self.entry_sell(asset, output)
                 )
             profit = proceeds - cost - gas
+            confirmation_reason = None
+            if (
+                not coverage
+                and direction == FORWARD
+                and rfq_check
+                and rfq_check.source == "indicative"
+                and profit > 0
+            ):
+                confirmed = await self.rfq.check(
+                    symbol, str(ui(acquired, asset.decimals)), self.quantity_session(obs), side="Bid"
+                )
+                if (
+                    confirmed.usable(self.clock())
+                    and confirmed.source == "rfq"
+                    and confirmed.symbol == symbol
+                    and confirmed.side == "Bid"
+                    and confirmed.session == self.quantity_session(obs)
+                    and dec(confirmed.quantity) == ui(acquired, asset.decimals)
+                    and dec(confirmed.price or "0") > 0
+                ):
+                    rfq_check = confirmed
+                    obs = self.check_observation(confirmed)
+                    cost = self.stock_values.value(
+                        acquired, asset.decimals, obs.ask, p.backpack_fee_bps, buy=True
+                    )
+                    profit = proceeds - cost - gas
+                else:
+                    confirmation_reason = (
+                        "rfq_response_mismatch" if confirmed.state == "available" else confirmed.reason
+                    )
             if self.assets.get(symbol) != asset:
                 return None
             edge = Decimal(profit) * 10000 / cost
@@ -1943,11 +2208,16 @@ class SpreadMonitor:
                 "backpack_timestamp": obs.timestamp,
                 "backpack_session": self.quantity_session(obs),
                 "backpack_model": obs.session == "MODEL",
-                "backpack_source": "rfq" if rfq_check else "estimate",
+                "backpack_source": rfq_check.source if rfq_check else "estimate",
                 "backpack_valid_until": rfq_check.retry_at if rfq_check else None,
-                "backpack_quote_confirmed": rfq_check is not None,
-                "backpack_rfq_checked_at": rfq_check.checked_at if rfq_check else None,
-                "backpack_rfq_valid_until": rfq_check.retry_at if rfq_check else None,
+                "backpack_quote_confirmed": rfq_check is not None and rfq_check.source == "rfq",
+                "backpack_rfq_checked_at": rfq_check.checked_at
+                if rfq_check and rfq_check.source == "rfq"
+                else None,
+                "backpack_rfq_valid_until": rfq_check.retry_at
+                if rfq_check and rfq_check.source == "rfq"
+                else None,
+                "backpack_confirmation_reason": confirmation_reason,
                 "backpack_price": obs.ask if direction == FORWARD else obs.bid,
                 "backpack_fee_bps": p.backpack_fee_bps,
                 "settlement_required": True,
@@ -1999,7 +2269,7 @@ class SpreadMonitor:
                 )
             if not coverage:
                 self.volume_search.record(key, self.results[key])
-            if self.quote_observer and not coverage:
+            if self.quote_observer and not coverage and self.results[key]["backpack_quote_confirmed"]:
                 self.quote_observer(self.results[key])
             if not coverage:
                 self.failures.pop(key, None)
@@ -2084,6 +2354,10 @@ class SpreadMonitor:
             if fresh_samples and not coverage:
                 self.results[key] = max(fresh_samples, key=lambda r: r["profit_raw"])
                 self.price_history[key] = price_pair(self.results[key])
+            if coverage_state and self.indicative_feed is not None:
+                screened = await self.screen_forward_sizes(coverage_state, quote)
+                if screened is not None:
+                    previous_result = screened
             return actual
         except asyncio.CancelledError:
             self.results.pop(key, None)
@@ -2151,6 +2425,50 @@ class SpreadMonitor:
                     self.results[key] = previous_result
             self.updated.set()
         return None
+
+    async def screen_forward_sizes(self, state: ForwardCoverage, plan: dict) -> dict | None:
+        """Reprice the size grid from the same ready bank, without new route reads."""
+        from .direct import DirectRaydium
+
+        provider = self.quote_provider
+        if not isinstance(provider, DirectRaydium) or not provider.bank_versions_are_current(
+            provider.bank_versions(plan)
+        ):
+            return None
+        asset = state.asset
+        try:
+            obs = self.coverage_observation(asset)
+            cap = self.budget(asset, obs)
+            floor = self.size_floor(asset, obs)
+        except (ValueError, KeyError, TypeError, ArithmeticError):
+            return None
+        samples: list[tuple[dict, dict]] = []
+        seen: set[int] = set()
+        key = asset.symbol, FORWARD
+        for budget in sorted(
+            {min(cap, max(cap * part, floor)) for part in (Decimal("0.25"), Decimal("0.5"), Decimal(1))}
+        ):
+            if budget < floor:
+                continue
+            try:
+                quantity, _ = self.sizing(asset, obs, notional=budget)
+                if quantity in seen:
+                    continue
+                seen.add(quantity)
+                row = await self.quote(
+                    key, notional=budget, quote_pair=partial(provider.cached_plan_quote, plan=plan)
+                )
+                if row and row["size_feasible"]:
+                    samples.append((dict(row), dict(self.local_plans[key])))
+            except (ValueError, KeyError, TypeError, ArithmeticError):
+                continue
+        if not samples:
+            return None
+        result, owned_plan = max(samples, key=lambda pair: pair[0]["profit_raw"])
+        self.results[key] = result
+        self.local_plans[key] = owned_plan
+        self.price_history[key] = price_pair(result)
+        return result
 
     async def metadata_loop(self) -> None:
         while True:
@@ -2309,7 +2627,7 @@ class SpreadMonitor:
                         and key[0] in self.assets
                         and now >= self.local_after.get(key, 0)
                         and plan["mint"] == self.assets[key[0]].mint
-                        and plan["backpack_source"] in {"rfq", "spot"}
+                        and plan["backpack_source"] in {"rfq", "spot", "indicative"}
                         and ("_direct" in plan["dex_plan"] or "_direct_route" in plan["dex_plan"])
                     ]
                     for key in possible:
@@ -2392,6 +2710,8 @@ class SpreadMonitor:
                     )
             version = self.backpack.stock_feed.version
             waiters = [asyncio.create_task(self.backpack.stock_feed.wait(version))]
+            if self.indicative_feed is not None:
+                waiters.append(asyncio.create_task(self.indicative_feed.wait(self.indicative_feed.version)))
             if bank_changed is not None:
                 waiters.append(asyncio.create_task(bank_changed.wait()))
             try:
@@ -2450,6 +2770,7 @@ class SpreadMonitor:
             code
             for code, failed in (
                 ("backpack_rfq_unconfirmed", row.get("backpack_model") is True),
+                ("indicative_requires_rfq", row.get("backpack_source") == "indicative"),
                 ("cost_cap", not self.settings.monitor.auto_size and row["cost_raw"] > raw(p.max_cost_usdc)),
                 ("profit_below_minimum", row["profit_raw"] < raw(p.min_profit_usdc)),
                 ("edge_below_minimum", dec(row["edge_bps"]) < p.min_edge_bps),
@@ -2493,6 +2814,8 @@ class SpreadMonitor:
                 )
             except (ValueError, KeyError, TypeError, ArithmeticError):
                 pass
+            if state and current and verified and self.indicative_feed is not None:
+                self.sync_indicative_coverage(state)
             check = state.check if state and current and verified else None
             own = bool(
                 state is not None
@@ -2544,7 +2867,9 @@ class SpreadMonitor:
                     "state": status,
                     "reason": block["reason"]
                     if block
-                    else check.reason
+                    else (
+                        state.reason if check.source == "indicative" and state is not None else check.reason
+                    )
                     if rejected and check is not None
                     else state.reason
                     if state
@@ -2555,10 +2880,14 @@ class SpreadMonitor:
                     "cost_raw": state.result["cost_raw"] if state and state.result else None,
                     "profit_raw": state.result["profit_raw"] if state and state.result else None,
                     "route_inputs_fresh": fresh,
+                    "quote_source": check.source if check else None,
                 }
             )
         return {
             "enabled": self.forward_coverage_enabled,
+            "quote_source": "indicative" if self.indicative_feed is not None else "rfq",
+            "indicative_pricedfresh": priced if self.indicative_feed is not None else 0,
+            "rfq_pricedfresh": priced if self.indicative_feed is None else 0,
             "minimum_probe": True,
             "profitable_search_separate": True,
             "universe": len(self.assets),
@@ -2624,6 +2953,8 @@ class SpreadMonitor:
                     and 0 <= now - primary["dex_observed_at"] <= config.max_quote_age_s
                     and (
                         primary.get("backpack_source") == "spot"
+                        or primary.get("backpack_source") == "indicative"
+                        and 0 <= now - primary["backpack_timestamp"] < config.max_quote_age_s
                         or primary_check
                         and primary_check.checked_at == primary["backpack_timestamp"]
                         and dec(primary_check.price or "0") == dec(primary["backpack_price"])
@@ -2669,7 +3000,7 @@ class SpreadMonitor:
         for asset in self.assets.values():
             buy_check = self.rfq.latest.get((asset.symbol, "Bid"))
             coverage = self.forward_coverage.get(asset.symbol) if self.forward_coverage_enabled else None
-            if coverage and coverage.asset == asset and coverage.check:
+            if coverage and coverage.asset == asset and coverage.check and coverage.check.source == "rfq":
                 buy_check = coverage.check
             rfq_reason = "rfq_check_pending"
             rfq_eligible = not config.rfq_validation
@@ -2719,6 +3050,17 @@ class SpreadMonitor:
                         side_reason = "rfq_session_unavailable"
                 key = asset.symbol, direction
                 result = results.get(key)
+                if result and result.get("backpack_source") == "indicative":
+                    side_eligible = False
+                    side_reason = "indicative_quote_pending"
+                    try:
+                        exact_public = self.indicative_check(
+                            asset, result["acquired_raw"], result["backpack_session"]
+                        )
+                        side_eligible = exact_public.usable(now)
+                        side_reason = exact_public.reason
+                    except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+                        side_reason = error_code(error)
                 if result and result.get("backpack_source") == "rfq" and config.rfq_validation:
                     side_eligible = False
                     side_reason = "rfq_check_stale"
@@ -2784,6 +3126,12 @@ class SpreadMonitor:
                                 if row.get("minimum_coverage")
                                 else self.observation(asset)
                             )
+                            if row.get("backpack_source") == "indicative":
+                                public_check = self.indicative_check(
+                                    asset, row["acquired_raw"], row["backpack_session"]
+                                )
+                                observation = self.check_observation(public_check)
+                                row["backpack_valid_until"] = public_check.retry_at
                             if row.get("backpack_quote_confirmed"):
                                 if (
                                     now >= row["backpack_rfq_valid_until"]
@@ -2863,7 +3211,9 @@ class SpreadMonitor:
                 row.update(
                     quote_age_s=age,
                     fresh=fresh,
-                    candidate=fresh and bool(row.get("passes_model_limits")),
+                    candidate=fresh
+                    and bool(row.get("passes_model_limits"))
+                    and row.get("backpack_source") != "indicative",
                     chain=self.chain.get(asset.symbol, "unverified"),
                     error=self.failures.get(key),
                     error_causes=self.failure_causes.get(
@@ -2901,6 +3251,13 @@ class SpreadMonitor:
                     and row.get("backpack_quote_confirmed")
                     and fresh
                 )
+                display_eligible = bool(
+                    direction_eligible
+                    or source_eligible
+                    and result
+                    and fresh
+                    and row.get("backpack_source") == "indicative"
+                )
                 # Informational calls expose every validated positive minimum
                 # net. Trading thresholds continue to control candidate only.
                 row["signal_eligible"] = bool(
@@ -2915,13 +3272,13 @@ class SpreadMonitor:
                 )
                 if (side_eligible or self.books.available(asset.symbol)) and screen is not None:
                     screened_assets.add(asset.symbol)
-                if direction_eligible and result and fresh:
+                if display_eligible and result and fresh:
                     # Price availability is independent of profitability. Publish
                     # only validated prices here, without a hidden negative spread.
                     pair = price_pair(row)
                     pair["quote_age_s"] = max(0, now - pair["updated_at"])
                     prices.append(pair)
-                if (direction_eligible and positive) or include_hidden:
+                if (display_eligible and positive) or include_hidden:
                     rows.append(row)
                 if not direction_eligible or not positive:
                     diagnostics.append(
@@ -3019,6 +3376,7 @@ class SpreadMonitor:
             "notional_usdc": config.notional_usdc,
             "auto_size": config.auto_size,
             "backpack_price_ttl_s": config.max_quote_age_s,
+            "indicative_quote_ttl_s": config.max_quote_age_s,
             "dex_bank_ttl_s": self.settings.policy.quote_max_age_s,
             "forward_coverage": coverage_report,
             "unit_verified": sum(value == "verified_unit_mapping" for value in self.chain.values()),
@@ -3037,6 +3395,7 @@ class SpreadMonitor:
             "completed_quotes": self.completed_quotes,
             "local_calculations": self.local_calculations,
             "fresh_calculations": fresh_calculations,
+            "rfq_confirmed_calculations": sum(pair.get("backpack_source") == "rfq" for pair in prices),
             "stock_value_backend": self.stock_values.backend,
             "quote_retry_waiting": sum(now < deadline for deadline in self.retry_after.values()),
             "pending": len(self.pending),
@@ -3058,6 +3417,12 @@ class SpreadMonitor:
             "ws_connected": self.backpack.stock_feed.socket is not None,
             "ws_proxied": self.backpack.stock_feed.proxy is not None,
             "ws_reconnects": self.backpack.stock_feed.reconnects,
+            "indicative_ws": {
+                "enabled": self.indicative_feed is not None,
+                "connected": self.indicative_feed.socket is not None if self.indicative_feed else False,
+                "assets": len(self.indicative_feed.latest) if self.indicative_feed else 0,
+                "proxied": self.indicative_feed.proxy is not None if self.indicative_feed else False,
+            },
             "rate_limits": {
                 self.settings.dex_backend: self.jupiter.status(),
                 "backpack": self.backpack.http.status(),
@@ -3581,6 +3946,8 @@ def price_report(record: dict) -> list[str]:
         f"DEX {quote_time(record['dex_updated_at'], zone=False)} · {record['quote_age_s']:.0f}с"
     )
     lines.append(f"Комиссии учтены; gas {amount(record['gas_raw'])} USDC по модели.")
+    if record.get("backpack_source") == "indicative":
+        lines.append("BP: публичная limit-котировка; вход требует RFQ на этот объём и проверки баланса.")
     lines.extend(venue_links(record))
     return lines
 
