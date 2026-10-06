@@ -124,6 +124,8 @@ async def test_failed_math_is_not_cached(exact_bank):
     ]
     with pytest.raises(ClmmCalculationError):
         await router.quote_bank(*args, bank)
+    assert bank["_exact_quote_math"]["locks"] == {}
+    assert bank["_exact_quote_math"]["quotes"] == {}
     second = await router.quote_bank(*args, bank)
     assert await router.quote_bank(*args, bank) == second
     assert router.worker.call.await_count == 2
@@ -172,3 +174,81 @@ async def test_concurrent_identical_math_is_coalesced(exact_bank):
     results = await asyncio.gather(first, second)
     assert results[0] == results[1] and results[0] is not results[1]
     router.worker.call.assert_awaited_once()
+    assert bank["_exact_quote_math"]["locks"] == {}
+
+
+async def test_distinct_exact_amounts_from_same_bank_compute_concurrently(exact_bank):
+    router, bank, quote, _ = exact_bank
+    pool, source, target, quantity = (
+        quote["pool"],
+        quote["inputMint"],
+        quote["outputMint"],
+        int(quote["inAmount"]),
+    )
+    both_started, release = asyncio.Event(), asyncio.Event()
+    calculate = router.worker.call.side_effect
+    started = []
+
+    async def blocked_math(body):
+        started.append(body["amount"])
+        if len(started) == 2:
+            both_started.set()
+        await release.wait()
+        return calculate(body)
+
+    router.worker.call.side_effect = blocked_math
+    calls = [
+        asyncio.create_task(router.quote_bank(pool, source, target, amount, bank))
+        for amount in (quantity, quantity + 1)
+    ]
+    try:
+        await asyncio.wait_for(both_started.wait(), 1)
+        assert len(bank["_exact_quote_math"]["locks"]) == 2
+        release.set()
+        results = await asyncio.gather(*calls)
+        assert [result["inAmount"] for result in results] == [str(quantity), str(quantity + 1)]
+        assert router.worker.call.await_count == 2
+        assert bank["_exact_quote_math"]["locks"] == {}
+    finally:
+        release.set()
+        await asyncio.gather(*calls, return_exceptions=True)
+
+
+async def test_cancelled_waiter_cannot_replace_lock_while_other_callers_remain(exact_bank):
+    router, bank, quote, _ = exact_bank
+    args = quote["pool"], quote["inputMint"], quote["outputMint"], int(quote["inAmount"])
+    started, release = asyncio.Event(), asyncio.Event()
+    calculate = router.worker.call.side_effect
+
+    async def blocked_math(body):
+        started.set()
+        await release.wait()
+        return calculate(body)
+
+    router.worker.call.side_effect = blocked_math
+    holder = asyncio.create_task(router.quote_bank(*args, bank))
+    cancelled = asyncio.create_task(router.quote_bank(*args, bank))
+    remaining = asyncio.create_task(router.quote_bank(*args, bank))
+    calls = [holder, cancelled, remaining]
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        locks = bank["_exact_quote_math"]["locks"]
+        entry = next(iter(locks.values()))
+        assert entry["users"] == 3
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        assert entry["users"] == 2 and next(iter(locks.values())) is entry
+        late = asyncio.create_task(router.quote_bank(*args, bank))
+        calls.append(late)
+        await asyncio.sleep(0)
+        assert entry["users"] == 3 and next(iter(locks.values())) is entry
+        router.worker.call.assert_awaited_once()
+        release.set()
+        results = await asyncio.gather(holder, remaining, late)
+        assert results[0] == results[1] == results[2]
+        router.worker.call.assert_awaited_once()
+        assert locks == {}
+    finally:
+        release.set()
+        await asyncio.gather(*calls, return_exceptions=True)

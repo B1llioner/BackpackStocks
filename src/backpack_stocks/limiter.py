@@ -31,6 +31,7 @@ class PriorityLimiter:
         self.responses_429 = 0
         self.cooldowns = 0
         self.wait_s = 0.0
+        self.capacity_waiters: set[asyncio.Future] = set()
 
     async def acquire(self, priority: int = 0, category: str | None = None) -> None:
         started = time.monotonic()
@@ -95,6 +96,12 @@ class PriorityLimiter:
             self.category_last.get(category or "", 0) + self.categories.get(category or "", 0),
         )
 
+    def admit(self, now: float, category: str | None) -> None:
+        self.last = now
+        if category is not None:
+            self.category_last[category] = now
+        self.admitted += 1
+
     async def dispatch(self) -> None:
         while self.queue:
             self.queue = [item for item in self.queue if not item[2].cancelled()]
@@ -119,10 +126,7 @@ class PriorityLimiter:
             self.queue.remove(item)
             heapq.heapify(self.queue)
             _, _, future, category = item
-            self.last = now
-            if category is not None:
-                self.category_last[category] = now
-            self.admitted += 1
+            self.admit(now, category)
             future.set_result(None)
 
     async def close(self) -> None:
@@ -135,6 +139,8 @@ class PriorityLimiter:
         for _, _, future, _ in self.queue:
             future.cancel()
         self.queue.clear()
+        for future in self.capacity_waiters:
+            future.cancel()
 
     def status(self) -> dict:
         return {
@@ -150,7 +156,117 @@ class PriorityLimiter:
             },
             "admitted": self.admitted,
             "responses_429": self.responses_429,
-            "queued": len(self.queue),
+            "queued": len(self.queue) + len(self.capacity_waiters),
             "wait_s": self.wait_s,
             "cooldowns": self.cooldowns,
         }
+
+
+class RequestStart:
+    """A reserved connection whose pacing timestamp is committed at HTTP start."""
+
+    def __init__(self, scheduler: RequestScheduler, limiter: PriorityLimiter, category: str | None):
+        self.scheduler, self.limiter, self.category = scheduler, limiter, category
+        self.future = asyncio.get_running_loop().create_future()
+        self.started = asyncio.Event()
+        self.reserved = False
+        self.queued_at = time.monotonic()
+
+    async def start(self) -> None:
+        # A server cooldown can arrive while before_attempt is suspended.
+        # Keep that deadline and pace from the actual start, not the reservation.
+        while not self.scheduler.closed:
+            now = time.monotonic()
+            delay = self.limiter.ready_at(self.category) - now
+            if delay <= 0:
+                self.limiter.admit(now, self.category)
+                self.limiter.wait_s += now - self.queued_at
+                self.started.set()
+                return
+            await asyncio.sleep(min(1, delay))
+        raise asyncio.CancelledError
+
+    def release(self) -> None:
+        if self.reserved:
+            self.reserved = False
+            self.scheduler.capacity.release()
+        self.started.set()
+        self.scheduler.changed.set()
+
+
+class RequestScheduler:
+    """Select priority and rate budget together, before reserving a connection."""
+
+    def __init__(self, capacity: asyncio.Semaphore):
+        self.capacity = capacity
+        self.queue: list[tuple[int, int, RequestStart]] = []
+        self.sequence = itertools.count()
+        self.changed = asyncio.Event()
+        self.task: asyncio.Task | None = None
+        self.closed = False
+
+    async def acquire(
+        self, limiter: PriorityLimiter, priority: int = 0, category: str | None = None
+    ) -> RequestStart:
+        if self.closed:
+            raise asyncio.CancelledError
+        request = RequestStart(self, limiter, category)
+        limiter.capacity_waiters.add(request.future)
+        heapq.heappush(self.queue, (priority, next(self.sequence), request))
+        self.changed.set()
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self.dispatch())
+        try:
+            await request.future
+            return request
+        except asyncio.CancelledError:
+            limiter.capacity_waiters.discard(request.future)
+            request.release()
+            raise
+
+    async def dispatch(self) -> None:
+        while self.queue:
+            for _, _, request in self.queue:
+                if request.future.cancelled():
+                    request.limiter.capacity_waiters.discard(request.future)
+            self.queue = [item for item in self.queue if not item[2].future.cancelled()]
+            heapq.heapify(self.queue)
+            if not self.queue:
+                break
+            if self.capacity.locked():
+                self.changed.clear()
+                await self.changed.wait()
+                continue
+            now = time.monotonic()
+            ready = [item for item in self.queue if item[2].limiter.ready_at(item[2].category) <= now]
+            if not ready:
+                delay = min(item[2].limiter.ready_at(item[2].category) - now for item in self.queue)
+                await asyncio.sleep(min(1, max(0, delay)))
+                continue
+            item = min(ready)
+            limiter = item[2].limiter
+            if limiter.oldest_every and limiter.admitted % limiter.oldest_every == limiter.oldest_every - 1:
+                if item[0] > 0:
+                    item = min(
+                        (entry for entry in ready if entry[2].limiter is limiter), key=lambda entry: entry[1]
+                    )
+            self.queue.remove(item)
+            heapq.heapify(self.queue)
+            request = item[2]
+            request.limiter.capacity_waiters.discard(request.future)
+            await self.capacity.acquire()
+            request.reserved = True
+            request.future.set_result(None)
+            # Do not accumulate paced permits behind an asynchronous callback.
+            # The next permit is paced from this caller's actual HTTP start.
+            await request.started.wait()
+
+    async def close(self) -> None:
+        self.closed = True
+        if self.task:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+        for _, _, request in self.queue:
+            request.limiter.capacity_waiters.discard(request.future)
+            request.future.cancel()
+        self.queue.clear()

@@ -2571,6 +2571,47 @@ class SpreadMonitor:
             # residual search slot owns this complete fallback, not the baseline.
             return await (fallback or provider.quote_pair)(source, target, amount, priority=priority)
 
+    def sync_primary_banks(self) -> None:
+        """Prioritize current minimum routes even while their DEX banks expire."""
+        from .direct import DirectRaydium
+
+        provider = self.quote_provider
+        if not self.forward_coverage_enabled or not isinstance(provider, DirectRaydium):
+            return
+        feed = provider.bank_feed
+        if feed is None or not hasattr(feed, "set_primary"):
+            return
+        primary: set[tuple[str, str, str, int]] = set()
+        for state in self.forward_coverage.values():
+            plan = state.plan
+            if (
+                not plan
+                or not plan.get("minimum_coverage")
+                or plan.get("mint") != state.asset.mint
+                or plan.get("acquired_raw") != state.quantity_raw
+            ):
+                continue
+            try:
+                session, rules = self.coverage_rules(state.asset)
+                if (
+                    session != state.session
+                    or raw(self.minimum_quantity(state.asset, rules), state.asset.decimals)
+                    != state.quantity_raw
+                ):
+                    continue
+                if self.indicative_feed is not None:
+                    self.sync_indicative_coverage(state)
+                self.coverage_observation(state.asset)
+                if plan["backpack_session"] != state.session:
+                    continue
+                primary.update(
+                    (pool, source, target, 10)
+                    for pool, source, target, _, _ in provider.bank_versions(plan["dex_plan"])
+                )
+            except (ValueError, KeyError, TypeError, ArithmeticError):
+                continue
+        feed.set_primary(primary)
+
     async def schedule_quotes(self, quote_pair: Callable[..., Awaitable[dict]] | None = None) -> None:
         from .direct import DirectRaydium
 
@@ -2592,6 +2633,7 @@ class SpreadMonitor:
                     self.coverage_pending.discard(key)
                     self.search_pending.discard(key)
             self.adopt_coverage_routes()
+            self.sync_primary_banks()
             while not self.reporting and len(self.pending) < self.settings.monitor.concurrency:
                 provider = self.quote_provider
                 from .direct import DirectRaydium

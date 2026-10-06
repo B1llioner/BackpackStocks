@@ -147,14 +147,21 @@ async def test_background_banks_refresh_without_a_quote_and_invalidate_failed_da
         await feed.pool_snapshot(key, producer, 8)
         feed.promote(quote("pool", STOCK_MINT, USDC_MINT, 1, 2), 10)
         now[0] = 102.1
+        await asyncio.sleep(0.6)
+        producer.assert_awaited_once()
+        assert feed.peek(key)["observed"] == 100.0
+        assert not feed.changed.is_set()
+        now[0] = 104.1
         await asyncio.wait_for(feed.changed.wait(), 1.5)
-        assert feed.peek(key)["observed"] == 102.1
+        assert feed.peek(key)["observed"] == 104.1
         assert feed.refreshed == 1
         feed.changed.clear()
         producer.side_effect = ValueError("invalid complete bank")
-        now[0] = 104.2
+        now[0] = 108.2
         await asyncio.sleep(0.6)
         assert feed.peek(key) is None
+        assert key not in feed.ready
+        assert producer.await_count == 3
     finally:
         await feed.close()
 
@@ -173,10 +180,74 @@ async def test_background_bank_refresh_precedes_discovery_without_raising_rpc_ra
     try:
         await feed.pool_snapshot(key, producer, 8)
         feed.promote(quote("pool", STOCK_MINT, USDC_MINT, 1, 2), 10)
-        now[0] = 103.0
+        now[0] = 105.0
         await asyncio.wait_for(feed.changed.wait(), 1.5)
         assert [c.kwargs["priority"] for c in rpc.accounts.call_args_list] == [10, 5]
         assert all(c.kwargs["commitment"] == "confirmed" for c in rpc.accounts.call_args_list)
+    finally:
+        await feed.close()
+
+
+async def test_bank_read_cadence_uses_receipt_age_without_restamping_lagging_data(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("backpack_stocks.pool_bank_feed.time.time", lambda: now[0])
+    rpc = SimpleNamespace(accounts=AsyncMock(return_value={"context": {"slot": 200}, "value": [None]}))
+    feed = PoolBankFeed(rpc, 8, timer=lambda: now[0])
+    key = "pool", STOCK_MINT, USDC_MINT, 10
+
+    async def produce():
+        await feed.accounts(["pool"], priority=10)
+        return {"observed": now[0] - 3}
+
+    producer = AsyncMock(side_effect=produce)
+    try:
+        original = await feed.pool_snapshot(key, producer, 8)
+        assert original["observed"] == 97.0 and feed.received_at[key] == 100.0
+        now[0] = 102.1
+        reused = await feed.pool_snapshot(key, producer, 8)
+        assert reused is original and reused["observed"] == 97.0
+        assert feed.received_at[key] == 100.0
+        producer.assert_awaited_once()
+        rpc.accounts.assert_awaited_once()
+        now[0] = 104.1
+        refreshed = await feed.pool_snapshot(key, producer, 8)
+        assert refreshed is not original and refreshed["observed"] == 101.1
+        assert feed.received_at[key] == 104.1
+        assert producer.await_count == rpc.accounts.await_count == 2
+    finally:
+        await feed.close()
+
+
+async def test_stalled_background_refresh_cannot_extend_the_original_eight_second_price_ttl(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("backpack_stocks.pool_bank_feed.time.time", lambda: now[0])
+    feed = PoolBankFeed(None, 8, timer=lambda: now[0])
+    key = "pool", STOCK_MINT, USDC_MINT, 10
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def stalled():
+        started.set()
+        await release.wait()
+        return {"observed": now[0]}
+
+    producer = AsyncMock(return_value={"observed": now[0]})
+    try:
+        original = await feed.pool_snapshot(key, producer, 8)
+        feed.promote(quote("pool", STOCK_MINT, USDC_MINT, 1, 2), 10)
+        producer.side_effect = stalled
+        now[0] = 104.1
+        await asyncio.wait_for(started.wait(), 1.5)
+        assert feed.peek(key) is original and original["observed"] == 100.0
+        assert feed.received_at[key] == 100.0 and feed.refreshed == 0
+        now[0] = 107.999
+        assert feed.peek(key) is original
+        now[0] = 108.0
+        assert feed.peek(key) is None
+        now[0] = 108.2
+        assert feed.peek(key) is None and feed.status()["fresh_banks"] == 0
+        assert feed.ready[key] is original and original["observed"] == 100.0
+        assert feed.received_at[key] == 100.0 and not feed.changed.is_set()
+        assert producer.await_count == 2
     finally:
         await feed.close()
 

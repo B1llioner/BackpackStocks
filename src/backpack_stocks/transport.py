@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from .limiter import PriorityLimiter
+from .limiter import PriorityLimiter, RequestScheduler
 from .observability import event
 from .proxy import ProxyLogRedactor, checked_proxy
 from .rejection import api_error_metadata, classify_rejection
@@ -75,6 +75,7 @@ class Transport:
         )
         self.limiter = PriorityLimiter(interval, oldest_every=oldest_every)
         self.in_flight = asyncio.Semaphore(8)
+        self.requests = RequestScheduler(self.in_flight)
         self.responses_429 = 0
         self.byte_budget, self.max_response_bytes = byte_budget, max_response_bytes
         self.byte_history: deque[tuple[float, int]] = deque()
@@ -109,6 +110,7 @@ class Transport:
         }
 
     async def close(self) -> None:
+        await self.requests.close()
         await self.limiter.close()
         await self.client.aclose()
         self._redactor.close()
@@ -150,11 +152,13 @@ class Transport:
         writes = mutation if mutation is not None else method != "GET"
         for attempt in range(1 if writes else 3):
             try:
-                async with self.in_flight:
+                await self.bandwidth_slot()
+                start = await self.requests.acquire(admission, priority, category)
+                try:
                     await self.bandwidth_slot()
-                    await admission.acquire(priority, category)
                     if before_attempt is not None:
                         await before_attempt()
+                    await start.start()
                     current_headers = headers() if callable(headers) else headers
                     content = bytearray()
                     async with self.client.stream(
@@ -182,6 +186,8 @@ class Transport:
                             content=bytes(content),
                             request=received.request,
                         )
+                finally:
+                    start.release()
             except httpx.HTTPError:
                 admission.record_failure()
                 if writes:

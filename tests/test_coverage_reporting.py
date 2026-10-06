@@ -183,7 +183,7 @@ def test_public_coverage_and_account_rfq_confirmation_are_labeled_separately():
     text = "\n".join(format_forward_coverage(snapshot))
     assert "свежие индикативные расчёты 1; отдельные расчёты с подтверждённой RFQ 0" in text
     assert "свежие пары BP+DEX 1; нет текущей котировки Backpack 1" in text
-    assert "Свежие котировки покупки Backpack: 3/4" in text
+    assert "Проверена сторона покупки Backpack: 3/4; текущая цена есть у 2" in text
     assert "Положительный net по публичной котировке требует подтверждения RFQ на выбранный объём" in text
     assert "отказ BP" not in text and "Действующая проверка BP" not in text
     assert snapshot == before

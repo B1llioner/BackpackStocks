@@ -19,7 +19,7 @@ from pathlib import Path
 from solders.instruction import AccountMeta, Instruction
 from solders.pubkey import Pubkey
 
-from .clmm_worker import ClmmCalculationError, ClmmWorker
+from .clmm_worker import ClmmCalculationError, ClmmWorkerPool
 from .models import ATA, STOCK_MINT, TOKEN, TOKEN_2022, USDC_MINT, Settings, dec
 from .observability import MARKET_BLOCKS, QuoteUnavailable, error_code, event
 from .pool_bank_feed import PoolBankFeed
@@ -125,7 +125,7 @@ class DirectRaydium:
 
     def __init__(self, settings: Settings, rpc: SolanaRPC):
         self.settings, self.rpc = settings, rpc
-        self.worker = ClmmWorker(settings.direct.clmm_worker)
+        self.worker = ClmmWorkerPool(settings.direct.clmm_worker)
         self.calculator = PoolCalculator()
         catalog_path = Path(settings.direct.catalog)
         if (
@@ -310,6 +310,7 @@ class DirectRaydium:
             "quotes": self.quote_count,
             "failed_pools": self.failures,
             "cpmm_backend": self.calculator.backend,
+            "clmm_workers": self.worker.status(),
             "rpc": self.rpc.http.status(),
             "screen": self.screen_status,
             "via_sol": self.settings.direct.via_sol,
@@ -730,6 +731,7 @@ class DirectRaydium:
         # jsonParsed keeps unsupported program data as base64; mint/vault parsing is RPC-native.
         response = await rpc.accounts(refs, parsed=True, min_slot=min_slot, priority=priority)
         observed = time.time()
+        acquired_monotonic = time.monotonic()
         accounts = dict(zip(refs, response["value"], strict=True))
         account_bytes(accounts[pool], program, "PoolState", 1544 if program == CLMM else 637)
         state = decode_pool(accounts[pool])
@@ -811,6 +813,7 @@ class DirectRaydium:
             "bitmap": bitmap,
             "timestamp": timestamp,
             "observed": observed,
+            "_acquired_monotonic": acquired_monotonic,
             "response": response,
             "array_limit": array_limit,
             "arrays_verified": program == CLMM,
@@ -882,34 +885,46 @@ class DirectRaydium:
             raise LocalQuoteNotReady()
         memo = bank.get("_exact_quote_math")
         if memo is None or memo["bank_id"] != id(bank):
-            memo = {"bank_id": id(bank), "lock": asyncio.Lock(), "quotes": {}}
+            memo = {"bank_id": id(bank), "locks": {}, "quotes": {}}
             bank["_exact_quote_math"] = memo
-        async with memo["lock"]:
-            if not 0 <= time.time() - bank["observed"] < self.settings.policy.quote_max_age_s:
-                raise LocalQuoteNotReady()
-            slippage = self.settings.policy.slippage_bps
-            array_limit = bank.get("array_limit", self.settings.direct.max_tick_arrays)
-            key = (
-                pool,
-                source,
-                target,
-                amount,
-                slippage,
-                array_limit,
-                bank["response"]["context"]["slot"],
-                bank["observed"],
-            )
-            quotes = memo["quotes"]
-            if key not in quotes:
-                result = await self._quote_bank_math(
-                    pool, source, target, amount, bank, slippage=slippage, array_limit=array_limit
-                )
-                if len(quotes) >= 64:
-                    quotes.pop(next(iter(quotes)))
-                quotes[key] = deepcopy(result)
-            # _direct contains the bank's state. Even the first caller receives
-            # a copy so changing a route/result cannot poison the bank or cache.
+        slippage = self.settings.policy.slippage_bps
+        array_limit = bank.get("array_limit", self.settings.direct.max_tick_arrays)
+        key = (
+            pool,
+            source,
+            target,
+            amount,
+            slippage,
+            array_limit,
+            bank["response"]["context"]["slot"],
+            bank["observed"],
+        )
+        quotes = memo["quotes"]
+        if key in quotes:
             return deepcopy(quotes[key])
+        locks = memo["locks"]
+        entry = locks.setdefault(key, {"lock": asyncio.Lock(), "users": 0})
+        entry["users"] += 1
+        try:
+            # Different exact amounts can use independent SDK processes. Equal
+            # inputs share one calculation, including callers waiting for it.
+            async with entry["lock"]:
+                if not 0 <= time.time() - bank["observed"] < self.settings.policy.quote_max_age_s:
+                    raise LocalQuoteNotReady()
+                if key not in quotes:
+                    result = await self._quote_bank_math(
+                        pool, source, target, amount, bank, slippage=slippage, array_limit=array_limit
+                    )
+                    if len(quotes) >= 64:
+                        quotes.pop(next(iter(quotes)))
+                    quotes[key] = deepcopy(result)
+                # _direct contains the bank's state. Even the first caller
+                # receives a copy so it cannot poison the bank or cached math.
+                return deepcopy(quotes[key])
+        finally:
+            entry["users"] -= 1
+            if not entry["users"]:
+                locks.pop(key)
 
     async def _quote_bank_math(
         self,

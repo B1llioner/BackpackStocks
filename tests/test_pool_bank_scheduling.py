@@ -20,10 +20,10 @@ async def test_lagging_chain_clock_never_creates_continuous_reads_or_extends_quo
         assert (await feed.pool_snapshot(key, producer, 8))["observed"] == 96
         assert producer.await_count == 1
         assert feed.received_at[key] == 0  # Reading the cache cannot postpone a real refresh.
-        wall[0], elapsed[0] = 102.1, 2.1
+        wall[0], elapsed[0] = 104.1, 4.1
         await asyncio.wait_for(feed.changed.wait(), 1.5)
-        assert producer.await_count == 2 and feed.peek(key)["observed"] == 98.1
-        wall[0], elapsed[0] = 106.2, 2.2
+        assert producer.await_count == 2 and feed.peek(key)["observed"] == 100.1
+        wall[0], elapsed[0] = 108.2, 4.2
         assert feed.peek(key) is None  # Freshness always uses the original chain time.
         await asyncio.sleep(0.6)
         assert producer.await_count == 2
@@ -43,7 +43,7 @@ async def test_full_universe_round_reaches_rpc_batches_without_serial_pool_waves
         return {"context": {"slot": 200}, "value": refs}
 
     rpc = SimpleNamespace(accounts=AsyncMock(side_effect=rpc_read))
-    feed = PoolBankFeed(rpc, 8, timer=lambda: 3.0)
+    feed = PoolBankFeed(rpc, 8, timer=lambda: 5.0)
     try:
         for index in range(84):
             key = str(index), "stock", "USDC", 10

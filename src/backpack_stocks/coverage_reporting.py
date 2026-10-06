@@ -96,7 +96,8 @@ def format_forward_coverage(snapshot: dict) -> list[str]:
             + (f"нет текущей котировки Backpack {refused}; " if indicative_mode else f"отказ BP {refused}; ")
             + f"ожидают расчёта {awaiting}; закрыта сессия / несовместима партия {known_blocks}; "
             f"неподтверждены {unverified}.",
-            f"Свежие котировки покупки Backpack: {coverage['checked']}/{eligible}; "
+            f"Проверена сторона покупки Backpack: {coverage['checked']}/{eligible}; "
+            f"текущая цена есть у {coverage['checked'] - refused}; "
             "отсутствие котировки не даёт численной пары."
             if indicative_mode
             else f"Действующая проверка BP: {coverage['checked']}/{eligible}; отказ не даёт численной пары.",

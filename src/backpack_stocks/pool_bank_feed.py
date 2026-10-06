@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
 
 from .observability import error_code, event
@@ -12,6 +12,7 @@ from .quote_batch import QuoteAccountBatch
 
 BankKey = tuple[str, str, str, int]
 REFRESHING: ContextVar[bool] = ContextVar("refreshing_pool_bank", default=False)
+REFRESH_PRIORITY: ContextVar[int] = ContextVar("pool_bank_refresh_priority", default=5)
 
 
 class PoolBankFeed(QuoteAccountBatch):
@@ -21,6 +22,7 @@ class PoolBankFeed(QuoteAccountBatch):
         self.producers: dict[BankKey, Callable[[], Awaitable[dict]]] = {}
         self.ready: dict[BankKey, dict] = {}
         self.hot: dict[BankKey, float] = {}
+        self.primary: frozenset[BankKey] | None = None
         self.retry_at: dict[BankKey, float] = {}
         self.received_at: dict[BankKey, float] = {}
         self.timer = timer
@@ -35,7 +37,7 @@ class PoolBankFeed(QuoteAccountBatch):
     def remember(self, key: BankKey, bank: dict) -> None:
         if self.ready.get(key) is not bank:
             self.ready[key] = bank
-            self.received_at[key] = self.timer()
+            self.received_at[key] = bank.get("_acquired_monotonic", self.timer())
 
     def peek(self, key: BankKey) -> dict | None:
         task = self.pool_banks.get(key)
@@ -52,7 +54,7 @@ class PoolBankFeed(QuoteAccountBatch):
         if (
             bank is not None
             and time.time() - bank["observed"] < max_age
-            and self.timer() - self.received_at.get(key, float("-inf")) < self.max_age / 4
+            and self.timer() - self.received_at.get(key, float("-inf")) < self.max_age / 2
         ):
             return bank
         try:
@@ -64,11 +66,15 @@ class PoolBankFeed(QuoteAccountBatch):
         return bank
 
     async def accounts(self, addresses, *, parsed=False, min_slot=None, priority=0):
-        # Refresh winning routes ahead of new route discovery; execution reads
-        # at priority zero remain ahead of both. Cache keys keep quote priority.
+        # Current minimum routes precede other retained plans. Execution reads
+        # at priority zero remain first. Cache keys keep their original priority.
         if REFRESHING.get():
-            priority = min(priority, 5)
+            priority = min(priority, REFRESH_PRIORITY.get())
         return await super().accounts(addresses, parsed=parsed, min_slot=min_slot, priority=priority)
+
+    def set_primary(self, keys: Iterable[BankKey]) -> None:
+        """Classify known route banks without changing their age or retention."""
+        self.primary = frozenset(key for key in keys if key in self.producers)
 
     def promote(self, quote: dict, priority: int) -> None:
         for leg in quote["routePlan"]:
@@ -92,13 +98,21 @@ class PoolBankFeed(QuoteAccountBatch):
                     continue
                 # Chain Clock may already lag wall time by several seconds on
                 # receipt. It measures price freshness, not read scheduling.
-                if bank and elapsed - self.received_at.get(key, float("-inf")) < self.max_age / 4:
+                # Reserve half the unchanged TTL for the paced RPC round and
+                # complete-bank validation. Polling every quarter-TTL doubled
+                # that work and could expire the previous bank in its queue.
+                if bank and elapsed - self.received_at.get(key, float("-inf")) < self.max_age / 2:
                     continue
                 due.append(key)
-            for key in sorted(due, key=lambda k: self.received_at.get(k, 0)):
+            primary = self.primary
+            for key in sorted(
+                due,
+                key=lambda k: (primary is not None and k not in primary, self.received_at.get(k, 0)),
+            ):
 
-                async def refresh(key=key):
+                async def refresh(key=key, priority=5 if primary is None or key in primary else 10):
                     token = REFRESHING.set(True)
+                    priority_token = REFRESH_PRIORITY.set(priority)
                     try:
                         async with self.limit:
                             bank = await self.producers[key]()
@@ -114,6 +128,7 @@ class PoolBankFeed(QuoteAccountBatch):
                         event("pool_bank_refresh_blocked", pool=key[0], code=error_code(error))
                         raise
                     finally:
+                        REFRESH_PRIORITY.reset(priority_token)
                         REFRESHING.reset(token)
 
                 task = asyncio.create_task(refresh())

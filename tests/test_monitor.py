@@ -873,12 +873,11 @@ async def test_slow_monitor_response_does_not_hold_execution_request_lock():
 
 
 async def test_every_jupiter_retry_is_rate_limited():
-    attempts = 0
+    starts = []
 
     def handler(request):
-        nonlocal attempts
-        attempts += 1
-        return httpx.Response(429 if attempts == 1 else 200, json={})
+        starts.append(asyncio.get_running_loop().time())
+        return httpx.Response(429 if len(starts) == 1 else 200, json={})
 
     jup = Jupiter(
         interval=0.001,
@@ -887,9 +886,9 @@ async def test_every_jupiter_retry_is_rate_limited():
             client=httpx.AsyncClient(base_url="https://example.com", transport=httpx.MockTransport(handler)),
         ),
     )
-    jup.limiter.acquire = AsyncMock()
     try:
         await jup.prices([STOCK_MINT])
-        assert jup.limiter.acquire.await_count == 2
+        assert len(starts) == jup.limiter.admitted == 2
+        assert starts[1] - starts[0] >= jup.limiter.interval - 0.01
     finally:
         await jup.close()
