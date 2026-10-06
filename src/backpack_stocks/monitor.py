@@ -2299,7 +2299,17 @@ class SpreadMonitor:
                 self.quote_provider, DirectRaydium
             ) and self.quote_provider.bank_versions_are_current(self.results[key]["dex_bank_versions"]):
                 version = self.local_input_version(key, plan)
-                if version is not None:
+                minimum_owner = (
+                    direction == FORWARD
+                    and self.forward_coverage_enabled
+                    and (owner := self.forward_coverage.get(symbol)) is not None
+                    and owner.plan is not None
+                )
+                if version is not None and (coverage or not minimum_owner):
+                    if plan["backpack_source"] == "indicative":
+                        # Record what was calculated, never a newer WS value
+                        # that arrived while this exact quote was in flight.
+                        version = (version[0], (plan["backpack_timestamp"], plan["backpack_price"]))
                     self.local_inputs[key] = version
             self.local_calculations += local_plan is not None
             if not coverage:
@@ -2354,10 +2364,6 @@ class SpreadMonitor:
             if fresh_samples and not coverage:
                 self.results[key] = max(fresh_samples, key=lambda r: r["profit_raw"])
                 self.price_history[key] = price_pair(self.results[key])
-            if coverage_state and self.indicative_feed is not None:
-                screened = await self.screen_forward_sizes(coverage_state, quote)
-                if screened is not None:
-                    previous_result = screened
             return actual
         except asyncio.CancelledError:
             self.results.pop(key, None)
@@ -2431,8 +2437,12 @@ class SpreadMonitor:
         from .direct import DirectRaydium
 
         provider = self.quote_provider
-        if not isinstance(provider, DirectRaydium) or not provider.bank_versions_are_current(
-            provider.bank_versions(plan)
+        if not isinstance(provider, DirectRaydium) or provider.bank_feed is None:
+            return None
+        versions = provider.bank_versions(plan)
+        if not versions or any(
+            provider.bank_feed.peek((pool, source, target, 10)) is None
+            for pool, source, target, _, _ in versions
         ):
             return None
         asset = state.asset
@@ -2699,7 +2709,18 @@ class SpreadMonitor:
                     search_quote = partial(
                         self.cached_forward_search_quote, plan=coverage.plan["dex_plan"], fallback=quote_pair
                     )
-                if selected in self.optimization_requested:
+                if (
+                    self.indicative_feed is not None
+                    and selected[1] == FORWARD
+                    and coverage
+                    and coverage.plan is not None
+                    and selected not in self.optimization_requested
+                ):
+                    self.optimization_requested.discard(selected)
+                    self.pending[selected] = asyncio.create_task(
+                        self.screen_forward_sizes(coverage, coverage.plan["dex_plan"])
+                    )
+                elif selected in self.optimization_requested:
                     self.optimization_requested.discard(selected)
                     self.pending[selected] = asyncio.create_task(
                         self.optimize(selected, quote_pair=search_quote)

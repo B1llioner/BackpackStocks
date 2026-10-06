@@ -101,7 +101,7 @@ async def test_clmm_refresh_uses_one_complete_new_bank_and_still_rejects_bad_vau
             first = await router.quote_bank(*key[:3], int(q["inAmount"]), refreshed)
             second = await router.quote_bank(*key[:3], int(q["inAmount"]), refreshed)
             assert first["outAmount"] == second["outAmount"]
-            assert [call.args[0]["op"] for call in router.worker.call.await_args_list] == ["quote", "quote"]
+            assert [call.args[0]["op"] for call in router.worker.call.await_args_list] == ["quote"]
         rpc.accounts.assert_awaited_once()
         assert rpc.accounts.call_args.kwargs["parsed"] is True
         assert set(rpc.accounts.call_args.args[0]) == set(bank["accounts"])

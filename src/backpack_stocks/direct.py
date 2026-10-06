@@ -11,6 +11,7 @@ import struct
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
@@ -866,22 +867,69 @@ class DirectRaydium:
             return await self.quote_bank(pool, source, target, amount, bank)
 
     async def quote_bank(self, pool: str, source: str, target: str, amount: int, bank: dict) -> dict:
-        state, program, accounts = bank["state"], bank["program"], bank["accounts"]
+        """Reuse exact math only within this validated bank, keeping its original age."""
+        state = bank["state"]
         if (
             type(amount) is not int
             or not 0 < amount < 2**63
+            or source == target
             or {source, target} != {state["mintA"], state["mintB"]}
         ):
             raise ValueError("Invalid local bank amount/pair")
+        # The feed still selects the current complete bank and guards its head.
+        # Cached math cannot make an expired/future acquisition usable again.
+        if not 0 <= time.time() - bank["observed"] < self.settings.policy.quote_max_age_s:
+            raise LocalQuoteNotReady()
+        memo = bank.get("_exact_quote_math")
+        if memo is None or memo["bank_id"] != id(bank):
+            memo = {"bank_id": id(bank), "lock": asyncio.Lock(), "quotes": {}}
+            bank["_exact_quote_math"] = memo
+        async with memo["lock"]:
+            if not 0 <= time.time() - bank["observed"] < self.settings.policy.quote_max_age_s:
+                raise LocalQuoteNotReady()
+            slippage = self.settings.policy.slippage_bps
+            array_limit = bank.get("array_limit", self.settings.direct.max_tick_arrays)
+            key = (
+                pool,
+                source,
+                target,
+                amount,
+                slippage,
+                array_limit,
+                bank["response"]["context"]["slot"],
+                bank["observed"],
+            )
+            quotes = memo["quotes"]
+            if key not in quotes:
+                result = await self._quote_bank_math(
+                    pool, source, target, amount, bank, slippage=slippage, array_limit=array_limit
+                )
+                if len(quotes) >= 64:
+                    quotes.pop(next(iter(quotes)))
+                quotes[key] = deepcopy(result)
+            # _direct contains the bank's state. Even the first caller receives
+            # a copy so changing a route/result cannot poison the bank or cache.
+            return deepcopy(quotes[key])
+
+    async def _quote_bank_math(
+        self,
+        pool: str,
+        source: str,
+        target: str,
+        amount: int,
+        bank: dict,
+        *,
+        slippage: int,
+        array_limit: int,
+    ) -> dict:
+        state, program, accounts = bank["state"], bank["program"], bank["accounts"]
         arrays, bitmap = list(bank["arrays"]), bank["bitmap"]
         timestamp, observed, response = bank["timestamp"], bank["observed"], bank["response"]
         direction = source == state["mintA"]
         if program == CPMM:
             state["quoteSupported"] = True
             frame = PreparedCpmmPools(self.calculator, [state])
-            output, _, error = frame.quote_batch([(0, direction, amount, self.settings.policy.slippage_bps)])[
-                0
-            ]
+            output, _, error = frame.quote_batch([(0, direction, amount, slippage)])[0]
             if error:
                 raise ValueError("Unquotable CPMM amount")
             spot = dec(
@@ -891,7 +939,7 @@ class DirectRaydium:
             )
         else:
             params = self._worker_params(pool, accounts[pool], accounts[bitmap], source)
-            params["maxArrays"] = bank.get("array_limit", self.settings.direct.max_tick_arrays)
+            params["maxArrays"] = array_limit
             if not bank.get("arrays_verified"):
                 expected = (await self.worker.call({**params, "op": "addresses"}))["addresses"]
                 if expected != arrays:
@@ -944,7 +992,7 @@ class DirectRaydium:
             "outputMint": target,
             "inAmount": str(amount),
             "outAmount": str(output),
-            "otherAmountThreshold": str(output * (10000 - self.settings.policy.slippage_bps) // 10000),
+            "otherAmountThreshold": str(output * (10000 - slippage) // 10000),
             "priceImpact": str(impact),
             "swapMode": "ExactIn",
             "router": "Direct Raydium",
