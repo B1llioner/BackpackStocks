@@ -559,6 +559,84 @@ def test_monitor_status_distinguishes_signal_count_and_closed_market(bot):
     assert "RFQ-сессия закрыта" in text and "05.10 03:00 МСК" in text
 
 
+async def test_monitor_command_reports_minimum_pass_and_current_negative_pairs_separately(bot):
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from test_forward_coverage import coverage_monitor
+    from test_monitor import asset, observed
+
+    from backpack_stocks.monitor import FORWARD
+
+    controller, server = bot
+    mon, clock = coverage_monitor()
+    clock.now = datetime(2026, 10, 6, 16, tzinfo=UTC).timestamp()
+    mon.metadata_at = clock()
+    mon.sessions = [
+        {
+            "name": "US_EQUITIES_REGULAR",
+            "timezone": "America/New_York",
+            "startTime": "09:30:00",
+            "endTime": "16:00:00",
+            "startWeekday": 1,
+            "endWeekday": 5,
+        }
+    ]
+    mon.settings.monitor.max_quote_age_s = mon.rfq.max_age = 15
+    for symbol in ("OLD.US", "REFUSED.US", "CLOSED.US", "LOT.US", "UNVERIFIED.US"):
+        item = asset(symbol, deposit=False)
+        if symbol == "CLOSED.US":
+            item = replace(item, sessions=())
+        elif symbol == "LOT.US":
+            item = replace(item, sessions=({**item.sessions[0], "maxQuantity": "0.1"},))
+        mon.assets[symbol] = item
+        mon.chain[symbol] = (
+            "unsupported_mint_or_unit_mapping" if symbol == "UNVERIFIED.US" else "verified_unit_mapping"
+        )
+        mon.backpack.stock_feed.latest[item.ticker] = observed(clock)
+
+    original_inspect = mon.rfq.inspect.side_effect
+
+    async def inspect(symbol, side, quantity, session):
+        if symbol == "REFUSED.US":
+            return mon.rfq.result(
+                symbol, side, quantity, session, "unavailable", "rfq_insufficient_balance"
+            )
+        return await original_inspect(symbol, side, quantity, session)
+
+    mon.rfq.inspect.side_effect = inspect
+    old = await mon.quote(("OLD.US", FORWARD), coverage=True)
+    assert old and old["profit_raw"] < 0
+    clock.now += 15
+    for item in mon.assets.values():
+        mon.backpack.stock_feed.latest[item.ticker] = observed(clock)
+    current = await mon.quote(("WEN.US", FORWARD), coverage=True)
+    assert current and current["profit_raw"] < 0
+    assert await mon.quote(("REFUSED.US", FORWARD), coverage=True) is None
+    mon.choose_forward_coverage()  # Classify closed sessions and incompatible minimum lots.
+    snapshot = mon.snapshot()
+    coverage = snapshot["forward_coverage"]
+    assert coverage["done_universe"] and coverage["first_pass_completed"] == 5
+    assert coverage["pricedfresh"] == 1 and coverage["known_blocks"] == 2
+    assert coverage["waiting"] == 3 and coverage["refused"] == coverage["unverified"] == 1
+    assert len(snapshot["prices"]) == 1 and snapshot["prices"][0]["profit_raw"] < 0
+    assert snapshot["signal_candidates"] == 0
+
+    controller.engine.settings.monitor.auto_size = True
+    controller.engine.monitor = mon
+    await controller.handle(update(text="/monitor"))
+    text = server.replies()[-1]["text"]
+    assert "BP → DEX · первичный проход 5/5 допустимых · завершён" in text
+    assert "Минимальная законная партия; результат относится только к этому объёму" in text
+    assert "Сейчас из 6: свежие пары BP+DEX 1; отказ BP 1; ожидают расчёта 1" in text
+    assert "закрыта сессия / несовместима партия 2; неподтверждены 1" in text
+    assert "Действующая проверка BP: 2/5; отказ не даёт численной пары" in text
+    assert "В работе 0; ожидают свежих данных DEX 0; нет маршрута по актуальным данным 0" in text
+    assert "Без попытки или установленной причины: 0/5" in text
+    assert "Свежесть цены: BP до 15с; DEX до 8с" in text
+    assert controller.engine.status()["stopped"] and controller.engine.store.cycles() == []
+
+
 @pytest.mark.parametrize(
     "text", ["/resume --live", "/resume FLWS", "/resume@another_bot", "/exec rm", "/live", "/withdraw"]
 )

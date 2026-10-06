@@ -69,6 +69,88 @@ async def test_exact_size_cache_best_prices_and_only_await_accept():
     bp.accept_rfq.assert_not_called()
 
 
+async def test_early_exact_refresh_keeps_old_price_usable_and_coalesces_concurrent_requests():
+    clock = Clock()
+    bp, validator = setup(clock)
+    old = await validator.check("WEN.US", "0.16", "REGULAR")
+    clock.now += 1
+    entered, release = asyncio.Event(), asyncio.Event()
+    records = bp.rfqs.side_effect
+
+    async def held_records(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        result = await records(*args, **kwargs)
+        result[0]["quotes"][0]["askPrice"] = "12"
+        result[0]["quotes"][1]["askPrice"] = "13"
+        return result
+
+    bp.rfqs.side_effect = held_records
+    first = asyncio.create_task(validator.check("WEN.US", "0.16", "REGULAR", force_refresh=True))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert validator.cached_exact("WEN.US", "0.16", "REGULAR") is old
+        assert old.usable(clock()) and old.retry_at == old.checked_at + validator.max_age
+        second = asyncio.create_task(validator.check("WEN.US", "0.160", "REGULAR", force_refresh=True))
+        await asyncio.sleep(0)
+        release.set()
+        renewed, duplicate = await asyncio.gather(first, second)
+        assert renewed is duplicate and renewed is not old
+        assert renewed.price == "12" and renewed.quantity == "0.16" and renewed.side == "Bid"
+        assert renewed.retry_at == renewed.checked_at + validator.max_age
+        assert validator.cached_exact("WEN.US", "0.16", "REGULAR") is renewed
+        assert await validator.check("WEN.US", "0.16", "REGULAR") is renewed
+        assert bp.submit_rfq.await_count == bp.cancel_rfq.await_count == 2
+        assert [call.args[0] for call in bp.submit_rfq.await_args_list] == ["0.16", "0.16"]
+        assert all(call.kwargs["side"] == "Bid" for call in bp.submit_rfq.await_args_list)
+        bp.accept_rfq.assert_not_called()
+    finally:
+        for task in (first, second):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (first, second) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.parametrize("state,reason", [
+    ("unavailable", "rfq_insufficient_balance"),
+    ("unavailable", "rfq_no_quote"),
+    ("unknown", "rfq_check_timeout"),
+])
+async def test_forced_refresh_does_not_bypass_same_quantity_cooldown(state, reason):
+    clock = Clock()
+    bp, validator = setup(clock)
+    refused = validator.result("WEN.US", "Bid", "0.16", "REGULAR", state, reason)
+    validator.cache[("WEN.US", "Bid", "0.16", "REGULAR")] = refused
+    validator.latest[("WEN.US", "Bid")] = refused
+    clock.now += 1
+    assert await validator.check("WEN.US", "0.16", "REGULAR", force_refresh=True) is refused
+    bp.submit_rfq.assert_not_called()
+    bp.accept_rfq.assert_not_called()
+
+
+@pytest.mark.parametrize("reason,allowed", [
+    ("rfq_insufficient_balance", True),
+    ("rfq_invalid_quantity", True),
+    ("rfq_no_quote", True),
+    ("rfq_session_unavailable", False),
+])
+async def test_forced_refresh_preserves_other_quantity_refusal_rules(reason, allowed):
+    clock = Clock()
+    bp, validator = setup(clock)
+    refused = validator.result("WEN.US", "Bid", "1", "REGULAR", "unavailable", reason)
+    validator.latest[("WEN.US", "Bid")] = refused
+    result = await validator.check("WEN.US", "0.16", "REGULAR", force_refresh=True)
+    if allowed:
+        assert result.quantity == "0.16" and result.usable(clock())
+        bp.submit_rfq.assert_awaited_once()
+        bp.cancel_rfq.assert_awaited_once()
+    else:
+        assert result is refused
+        bp.submit_rfq.assert_not_called()
+    bp.accept_rfq.assert_not_called()
+
+
 async def test_expired_query_is_unknown_and_expired_cancellation_is_expected(caplog):
     clock = Clock()
     bp, validator = setup(clock)

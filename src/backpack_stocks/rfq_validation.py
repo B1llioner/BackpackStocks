@@ -96,14 +96,28 @@ class RfqValidator:
         cached = self.cache.get(key)
         return cached if cached and cached.usable(self.clock()) else None
 
-    async def check(self, symbol: str, quantity: str, session: str, *, side: str = "Bid") -> RfqCheck:
+    async def check(
+        self,
+        symbol: str,
+        quantity: str,
+        session: str,
+        *,
+        side: str = "Bid",
+        force_refresh: bool = False,
+    ) -> RfqCheck:
         if side not in {"Bid", "Ask"} or dec(quantity) <= 0:
             raise ValueError("Invalid RFQ validation request")
         quantity = format(dec(quantity).normalize(), "f")
         key = symbol, side, quantity, session
+        previous = self.cache.get(key)
         async with self.locks.setdefault(symbol, asyncio.Lock()):
             cached = self.cache.get(key)
-            if cached and cached.checked_at <= self.clock() < cached.retry_at:
+            # A concurrent renewal already replaced the entry while this call
+            # waited for the stock lock. Reuse it rather than opening another RFQ.
+            renew = (
+                force_refresh and cached is previous and cached is not None and cached.usable(self.clock())
+            )
+            if cached and cached.checked_at <= self.clock() < cached.retry_at and not renew:
                 return cached
             blocked = self.blocked(symbol, session, side)
             if blocked and not (blocked.reason in SIZE_REFUSALS and dec(blocked.quantity) != dec(quantity)):

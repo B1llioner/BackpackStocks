@@ -51,6 +51,7 @@ class Store:
                 # Paper scheduling may be tuned without abandoning its journal.
                 # Prices, amounts, fees, TTLs and every live setting stay pinned.
                 stored.monitor.concurrency = settings.monitor.concurrency
+                stored.monitor.rfq_concurrency = settings.monitor.rfq_concurrency
                 stored.monitor.exploration_s = settings.monitor.exploration_s
                 stored.monitor.quote_refresh_s = settings.monitor.quote_refresh_s
             if stored.model_dump_json() != encoded:

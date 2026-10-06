@@ -1,17 +1,34 @@
 import asyncio
-import time
+from types import SimpleNamespace
 
+import pytest
+
+from backpack_stocks import limiter as limiter_module
 from backpack_stocks.limiter import PriorityLimiter
 from backpack_stocks.solana import SolanaRPC
 
 
-async def test_rpc_oldest_turn_prevents_history_starvation_and_keeps_execution_first():
+async def test_rpc_oldest_turn_prevents_history_starvation_and_keeps_execution_first(monkeypatch):
+    clock = SimpleNamespace(now=1.0)
+    original_sleep = asyncio.sleep
+
+    class VirtualAsyncio:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        async def sleep(self, delay):
+            clock.now += delay
+            await original_sleep(0)
+
+    monkeypatch.setattr(limiter_module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(limiter_module, "asyncio", VirtualAsyncio())
     limiter = PriorityLimiter(0.01, oldest_every=4)
     admitted = []
 
     async def read(label, priority):
         await limiter.acquire(priority)
-        admitted.append((label, time.monotonic()))
+        # Consumer resumption can lag admission under load; verify dispatcher timestamps.
+        admitted.append((label, limiter.last))
 
     try:
         tasks = [asyncio.create_task(read("history", 20))]
@@ -19,7 +36,8 @@ async def test_rpc_oldest_turn_prevents_history_starvation_and_keeps_execution_f
         tasks.append(asyncio.create_task(read("execution", 0)))
         await asyncio.gather(*tasks)
         assert [label for label, _ in admitted[:4]] == ["execution", "pool0", "pool1", "history"]
-        assert all(b[1] - a[1] >= 0.009 for a, b in zip(admitted, admitted[1:], strict=False))
+        gaps = [b[1] - a[1] for a, b in zip(admitted, admitted[1:], strict=False)]
+        assert gaps == pytest.approx([0.01] * 9)
         assert limiter.admitted == 10
     finally:
         await limiter.close()

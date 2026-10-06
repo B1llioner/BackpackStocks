@@ -50,3 +50,4 @@ quote_refresh_s = 5
 max_quote_age_s = 15
 exploration_s = 30
 concurrency = 16 # Pipeline RFQ waits and shared RPC batches; transport limits stay unchanged.
+rfq_concurrency = 8 # Overlap RFQ response waits without changing Backpack request pacing.

@@ -15,6 +15,7 @@ from typing import TextIO
 
 import httpx
 
+from .coverage_reporting import format_forward_coverage
 from .engine import Engine
 from .limiter import PriorityLimiter
 from .models import Phase, ui
@@ -796,7 +797,7 @@ class TelegramController:
                 return monitor.prices_text([symbol] if symbol else None)
             if command == "monitor":
                 snapshot = monitor.snapshot()
-                return (
+                message = (
                     f"Акций: {snapshot['universe']}; unit mapping: {snapshot['unit_verified']}\n"
                     f"Свежих DEX quotes: {snapshot['fresh_quotes']}; кандидатов модели: {snapshot['candidates']}\n"
                     f"Оценка net > 0: {snapshot['positive_net_quotes']}; прибыль ≥ порога: {snapshot['profitable_after_costs']}\n"
@@ -818,6 +819,8 @@ class TelegramController:
                     f"причины: {snapshot.get('route_failure_causes', {})}"
                     f"\nОтказы расчётов с запуска (сумма попыток): {snapshot.get('blocked', {})}"
                 )
+                coverage_lines = format_forward_coverage(snapshot)
+                return message + ("\n\n" + "\n".join(coverage_lines) if coverage_lines else "")
             if symbol and symbol not in monitor.assets:
                 return "Акция не найдена в мониторе. /universe — доступные тикеры."
             symbol = (symbol or "WEN.US") if command == "spread" else None
