@@ -34,8 +34,10 @@ class QuoteAccountBatch:
     ) -> dict:
         """Reuse one validated bank for a request's size grid, preserving its age."""
         task = self.pool_banks.get(key)
-        if task is not None and task.done() and not task.cancelled() and task.exception() is None:
-            if time.time() - task.result()["observed"] >= max_age / 2:
+        if task is not None and task.done():
+            if task.cancelled() or task.exception() is not None:
+                task = None
+            elif not 0 <= time.time() - task.result()["observed"] < max_age / 2:
                 task = None
         if task is None:
 

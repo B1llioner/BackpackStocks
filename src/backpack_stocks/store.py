@@ -45,9 +45,16 @@ class Store:
         """)
         previous = self.get_meta("settings")
         encoded = settings.model_dump_json()
-        if previous and Settings.model_validate_json(previous).model_dump_json() != encoded:
-            self.close()
-            raise RuntimeError("Config differs from the database; use a new database for changed policy")
+        if previous:
+            stored = Settings.model_validate_json(previous)
+            if stored.mode == settings.mode == "paper":
+                # Paper scheduling may be tuned without abandoning its journal.
+                # Prices, amounts, fees, TTLs and every live setting stay pinned.
+                stored.monitor.concurrency = settings.monitor.concurrency
+                stored.monitor.exploration_s = settings.monitor.exploration_s
+            if stored.model_dump_json() != encoded:
+                self.close()
+                raise RuntimeError("Config differs from the database; use a new database for changed policy")
         self.set_meta("settings", encoded)
         self.set_meta("owner_epoch", self.epoch)
         if not self.get_meta("initialized"):

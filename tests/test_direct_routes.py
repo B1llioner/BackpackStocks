@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import copy
 import hashlib
@@ -16,6 +17,19 @@ from backpack_stocks.direct_routes import WSOL, combine, composed_quote, family_
 from backpack_stocks.models import STOCK_MINT, USDC_MINT, Settings
 from backpack_stocks.pool_state import CLMM
 from backpack_stocks.wallet_pools import ALPHABET, swap_pool_hints
+
+
+async def test_discovery_cooldown_does_not_wait_for_another_stocks_lock():
+    router = DirectRaydium(Settings(dex_backend="raydium", direct={"via_sol": True}), None)
+    router.candidates = {}
+    router.sol_candidates = {}
+    router.discovery_checked[STOCK_MINT] = time.time()
+    await router.discovery_lock.acquire()
+    try:
+        await asyncio.wait_for(router.ensure_candidates(STOCK_MINT), 0.05)
+    finally:
+        router.discovery_lock.release()
+        await router.close()
 
 
 def quote(pool, source, target, amount, output, *, observed=None):

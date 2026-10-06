@@ -183,6 +183,10 @@ class DirectRaydium:
     async def ensure_candidates(self, mint: str) -> None:
         if self.candidates.get(mint) and (not self.settings.direct.via_sol or self.sol_candidates.get(mint)):
             return
+        # A completed discovery cooldown must not queue behind another stock's
+        # slow discovery request. Keep the guarded recheck inside the lock too.
+        if time.time() - self.discovery_checked.get(mint, 0) < 300:
+            return
         async with self.discovery_lock:
             if time.time() - self.discovery_checked.get(mint, 0) < 300:
                 return
@@ -561,20 +565,34 @@ class DirectRaydium:
         if type(amount) is not int or not 0 < amount < 2**63 or source == target:
             raise ValueError("Invalid exact-in amount/pair")
         rpc = _rpc if _rpc is not None else self.rpc
-        initial = await rpc.accounts([pool], priority=priority)
-        initial_state = decode_pool(initial["value"][0])
-        program = initial["value"][0]["owner"]
+        bitmap = pda(CLMM, b"pool_tick_array_bitmap_extension", bytes(Pubkey.from_string(pool)))
+        hint = self.pool_catalog.get(pool, {})
+        min_slot = None
+        bitmap_response = None
+        if _rpc is not None and hint.get("program") == CPMM:
+            # Catalogue state supplies addresses only. The complete fresh bank
+            # below verifies the pool, routing, mints, vaults, fees and Clock.
+            initial_state = hint["snapshot"]["state"]
+            program = CPMM
+        else:
+            refs = [pool, bitmap] if _rpc is not None and hint.get("program") == CLMM else [pool]
+            initial = await rpc.accounts(refs, priority=priority)
+            initial_state = decode_pool(initial["value"][0])
+            program = initial["value"][0]["owner"]
+            min_slot = initial["context"]["slot"]
+            if len(refs) == 2:
+                bitmap_response = initial
         if program not in {CLMM, CPMM} or {source, target} != {
             initial_state["mintA"],
             initial_state["mintB"],
         }:
             raise ValueError("Direct pool pair/program mismatch")
-        bitmap = pda(CLMM, b"pool_tick_array_bitmap_extension", bytes(Pubkey.from_string(pool)))
         arrays: list[str] = []
-        min_slot = initial["context"]["slot"]
         if program == CLMM:
-            response = await rpc.accounts([pool, bitmap], min_slot=min_slot, priority=priority)
-            min_slot = max(min_slot, response["context"]["slot"])
+            response = bitmap_response or await rpc.accounts(
+                [pool, bitmap], min_slot=min_slot, priority=priority
+            )
+            min_slot = max(min_slot or 0, response["context"]["slot"])
             account_bytes(response["value"][1], CLMM, "TickArrayBitmapExtension", 1832)
             params = self._worker_params(pool, response["value"][0], response["value"][1], source)
             arrays = (await self.worker.call({**params, "op": "addresses"}))["addresses"]
@@ -674,11 +692,20 @@ class DirectRaydium:
         if type(amount) is not int or not 0 < amount < 2**63 or source == target:
             raise ValueError("Invalid exact-in amount/pair")
         fetch = partial(self._pool_bank, pool, source, target, amount, priority=priority, _rpc=_rpc)
+        banks = _rpc
+        if (
+            _rpc is not None
+            and isinstance(_rpc.rpc, QuoteAccountBatch)
+            and {source, target} == {WSOL, USDC_MINT}
+        ):
+            # Stocks keep request-local banks. Shared SOL/USDC bridge banks are
+            # amount-independent and retain their original observation time.
+            banks = _rpc.rpc
         bank = (
-            await _rpc.pool_snapshot(
+            await banks.pool_snapshot(
                 (pool, source, target, priority), fetch, self.settings.policy.quote_max_age_s
             )
-            if _rpc is not None and self.settings.direct.via_sol
+            if banks is not None and self.settings.direct.via_sol
             else await fetch()
         )
         state, program, accounts = bank["state"], bank["program"], bank["accounts"]

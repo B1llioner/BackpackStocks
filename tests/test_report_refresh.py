@@ -346,6 +346,33 @@ async def test_account_batch_preserves_groups_minimum_slot_priority_and_no_cache
         await batch.close()
 
 
+async def test_shared_bank_keeps_its_time_refreshes_before_ttl_and_retries_failures(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("backpack_stocks.quote_batch.time.time", lambda: now[0])
+    batch = QuoteAccountBatch(None)
+    producer = AsyncMock(side_effect=lambda: {"observed": now[0]})
+    key = ("bridge", "SOL", "USDC", 10)
+    try:
+        one, two = await asyncio.gather(
+            batch.pool_snapshot(key, producer, 8), batch.pool_snapshot(key, producer, 8)
+        )
+        assert one == two == {"observed": 100}
+        assert producer.await_count == 1
+        now[0] = 103
+        assert (await batch.pool_snapshot(key, producer, 8))["observed"] == 100
+        now[0] = 104
+        assert (await batch.pool_snapshot(key, producer, 8))["observed"] == 104
+        assert producer.await_count == 2
+        failing = AsyncMock(side_effect=[ValueError("bad bank"), {"observed": 104}])
+        bad_key = ("other", "SOL", "USDC", 10)
+        with pytest.raises(ValueError):
+            await batch.pool_snapshot(bad_key, failing, 8)
+        assert (await batch.pool_snapshot(bad_key, failing, 8))["observed"] == 104
+        assert failing.await_count == 2
+    finally:
+        await batch.close()
+
+
 async def test_batch_chunking_does_not_split_a_pool_between_banks():
     rpc = SimpleNamespace(
         accounts=AsyncMock(
@@ -405,8 +432,54 @@ async def test_batch_direct_quotes_keep_full_live_account_validation(monkeypatch
         async with router.batch_quotes() as quote_pair:
             result = await quote_pair(STOCK_MINT, USDC_MINT, 1_000_000, priority=10)
             assert result["outAmount"] == "6238893"
+            assert rpc.accounts.await_count == 2  # One pool+bitmap read and one complete validated bank.
             rows[STOCK_MINT]["data"]["parsed"]["info"]["decimals"] = 5
             with pytest.raises(ValueError):
                 await quote_pair(STOCK_MINT, USDC_MINT, 1_000_000, priority=10)
     finally:
+        await router.close()
+
+
+async def test_background_direct_quotes_share_rpc_batches_and_keep_concurrency_bound(monitor, monkeypatch):
+    mon, _ = monitor
+    rpc = SimpleNamespace(
+        accounts=AsyncMock(side_effect=lambda refs, **kw: {"context": {"slot": 200}, "value": refs})
+    )
+    router = DirectRaydium(Settings(dex_backend="raydium"), rpc)
+    mon.jupiter = router
+    mon.settings.monitor.concurrency = 8
+    keys = [(f"S{i:02d}.US", FORWARD) for i in range(12)]
+    remaining = iter(keys)
+    started = []
+    completed = asyncio.Event()
+
+    def choose():
+        return next(remaining, None)
+
+    async def calculate(source, target, amount, *, priority=0, _rpc=None):
+        result = await _rpc.accounts([source, "shared_bridge"], priority=priority)
+        return {"outAmount": str(amount), "contextSlot": result["context"]["slot"]}
+
+    async def quote(key, *, quote_pair, notional):
+        started.append(key)
+        result = await quote_pair(key[0], USDC_MINT, 100, priority=10)
+        assert result["contextSlot"] == 200
+        if len(started) == 12:
+            completed.set()
+
+    monkeypatch.setattr(mon, "choose", choose)
+    monkeypatch.setattr(mon, "next_budget", lambda key: Decimal(100))
+    monkeypatch.setattr(mon, "quote", quote)
+    monkeypatch.setattr(router, "quote_pair", calculate)
+    task = asyncio.create_task(mon.quotes_loop())
+    try:
+        await asyncio.wait_for(completed.wait(), 2)
+        assert started == keys
+        assert rpc.accounts.await_count == 2
+        assert len(rpc.accounts.await_args_list[0].args[0]) == 9
+        assert all(len(call.args[0]) <= 9 for call in rpc.accounts.await_args_list)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await mon.close()
         await router.close()

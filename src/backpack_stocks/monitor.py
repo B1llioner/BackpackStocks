@@ -220,6 +220,7 @@ class SpreadMonitor:
         self.reporting = False
         self.last_report: dict = {}
         self.requested: dict[tuple[str, str], float] = {}
+        self.focus_until: dict[str, float] = {}
         self.updated = asyncio.Event()
         self.stock_values = StockValueCalculator()
         self.retry_after: dict[tuple[str, str], float] = {}
@@ -638,11 +639,10 @@ class SpreadMonitor:
                 ):
                     continue
                 if (
-                    direction == FORWARD
-                    and config.rfq_validation
+                    config.rfq_validation
                     and not spot
-                    and not self.rfq_ready(asset, session)
-                    and not size_probe
+                    and not self.rfq_ready(asset, session, direction)
+                    and not (direction == FORWARD and size_probe)
                 ):
                     continue
                 last = self.attempted.get(key, 0)
@@ -691,7 +691,14 @@ class SpreadMonitor:
             self.requested.pop((selected[2], selected[3]), None)
             return selected[2], selected[3]
         self._sequence += 1
-        overdue = [row for row in available if now - row[0] >= config.exploration_s]
+        self.focus_until = {s: end for s, end in self.focus_until.items() if end > now and s in self.assets}
+
+        def deadline(row):
+            period = config.quote_refresh_s if row[2] in self.focus_until else config.exploration_s
+            return row[0] + period
+
+        overdue = [row for row in available if deadline(row) <= now]
+        focused = [row for row in available if row[2] in self.focus_until]
         unseen = [row for row in available if row[0] == 0]
         fresh_positive = any(
             row.get("profit_raw", 0) > 0 and 0 <= now - row["dex_observed_at"] <= config.max_quote_age_s
@@ -705,8 +712,14 @@ class SpreadMonitor:
             selected = min(
                 [row for row in unseen if row[3] == side] or unseen, key=lambda row: (row[1], row[2])
             )
+        elif overdue:
+            # A missed refresh deadline takes priority on every slot. Reserving
+            # only every fourth slot multiplied a universe pass by four.
+            selected = min(overdue, key=lambda row: (deadline(row), row))
+        elif focused and self._sequence % 4 != 0:
+            selected = min(focused)
         elif self._sequence % 4 == 0 or not hot_available:
-            selected = min(overdue or available)
+            selected = min(available)
         else:
             selected = min(hot_available, key=lambda row: (row[1], row[0], row[2], row[3]))
         return selected[2], selected[3]
@@ -791,6 +804,27 @@ class SpreadMonitor:
                 self.rfq.latest[(asset.symbol, "Bid")] = check
         if self.assets.get(asset.symbol) != asset:
             self.rfq.invalidate(asset.symbol)
+        elif asset.deposit_enabled and not self.books.available(asset.symbol):
+            # Establish sell-side availability before spending DEX/RPC work.
+            # A usable Bid never substitutes for an Ask; the exact sale later
+            # still checks its own quantity and current price.
+            previous_sell = self.rfq.latest.get((asset.symbol, "Ask"))
+            if previous_sell is None or self.clock() >= previous_sell.eligibility_until:
+                try:
+                    obs = self.observation(asset)
+                    rules = self.quantity_rules(asset, obs)
+                    step = dec(rules["stepSize"])
+                    quantity = max(dec(rules["minQuantity"]), asset.deposit_min)
+                    quantity = (quantity / step).to_integral_value(rounding=ROUND_CEILING) * step
+                    if quantity > dec(rules["maxQuantity"]):
+                        raise RfqUnavailable("rfq_invalid_quantity")
+                    await self.rfq.check(asset.symbol, str(quantity), self.quantity_session(obs), side="Ask")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    self.rfq.latest[(asset.symbol, "Ask")] = self.rfq.result(
+                        asset.symbol, "Ask", "0", session, "unknown", error_code(error)
+                    )
         self.updated.set()
 
     async def rfq_loop(self) -> None:
@@ -817,9 +851,18 @@ class SpreadMonitor:
                     if len(pending) >= self.settings.monitor.rfq_concurrency:
                         break
                     previous = self.rfq.latest.get((asset.symbol, "Bid"))
+                    previous_sell = self.rfq.latest.get((asset.symbol, "Ask"))
                     if asset.symbol in pending or self.chain.get(asset.symbol) != "verified_unit_mapping":
                         continue
-                    if previous and self.clock() < previous.eligibility_until:
+                    if (
+                        previous
+                        and self.clock() < previous.eligibility_until
+                        and (
+                            not asset.deposit_enabled
+                            or self.books.available(asset.symbol)
+                            or (previous_sell and self.clock() < previous_sell.eligibility_until)
+                        )
+                    ):
                         continue
                     pending[asset.symbol] = asyncio.create_task(self.refresh_rfq_asset(asset))
                 await asyncio.sleep(0.5)
@@ -1327,6 +1370,17 @@ class SpreadMonitor:
             await asyncio.sleep(self.settings.monitor.price_batch_s)
 
     async def quotes_loop(self) -> None:
+        from .direct import DirectRaydium
+
+        if isinstance(self.quote_provider, DirectRaydium):
+            # Coalesce reads across stocks, not only across one stock's size
+            # grid. Each quote keeps its own validated bank and original age.
+            async with self.quote_provider.batch_quotes() as quote_pair:
+                await self.schedule_quotes(quote_pair)
+        else:
+            await self.schedule_quotes()
+
+    async def schedule_quotes(self, quote_pair: Callable[..., Awaitable[dict]] | None = None) -> None:
         while True:
             for key, task in list(self.pending.items()):
                 if task.done():
@@ -1339,10 +1393,12 @@ class SpreadMonitor:
                     break
                 if selected in self.optimization_requested:
                     self.optimization_requested.discard(selected)
-                    self.pending[selected] = asyncio.create_task(self.optimize(selected))
+                    self.pending[selected] = asyncio.create_task(
+                        self.optimize(selected, quote_pair=quote_pair)
+                    )
                 else:
                     self.pending[selected] = asyncio.create_task(
-                        self.quote(selected, notional=self.next_budget(selected))
+                        self.quote(selected, notional=self.next_budget(selected), quote_pair=quote_pair)
                     )
             version = self.backpack.stock_feed.version
             try:
@@ -1812,6 +1868,12 @@ class SpreadMonitor:
             "price_repeat_median_s": repeat_intervals[len(repeat_intervals) // 2]
             if repeat_intervals
             else None,
+            "price_repeat_p95_s": repeat_intervals[
+                min(len(repeat_intervals) - 1, int(len(repeat_intervals) * 0.95))
+            ]
+            if repeat_intervals
+            else None,
+            "focused_assets": sorted(s for s, end in self.focus_until.items() if end > now),
             "diagnostics": diagnostics,
             "rfq_validation": config.rfq_validation,
             "rfq_cache_ttl_s": config.rfq_cache_s,
@@ -1857,6 +1919,11 @@ class SpreadMonitor:
         if asset is None:
             return False
         now = self.clock()
+        # Keep recently observed wallet assets on the fast lane. The bounded
+        # focus only affects scheduling, never quote freshness or trade rules.
+        self.focus_until[symbol] = now + max(60, self.settings.monitor.exploration_s * 4)
+        if len(self.focus_until) > 8:
+            self.focus_until.pop(min(self.focus_until, key=lambda s: self.focus_until[s]))
         for direction in (FORWARD, REVERSE):
             if direction == FORWARD and self.budget_info(symbol).get("within_budget") is False:
                 continue
@@ -1889,7 +1956,9 @@ class SpreadMonitor:
         self.requested.setdefault(key, self.clock())
         return True
 
-    async def optimize(self, key: tuple[str, str]) -> None:
+    async def optimize(
+        self, key: tuple[str, str], *, quote_pair: Callable[..., Awaitable[dict]] | None = None
+    ) -> None:
         """Bounded exact-size search occupying one ordinary scheduler slot."""
         asset = self.assets[key[0]]
         cap = self.budget(asset, self.planning_observation(asset))
@@ -1912,7 +1981,7 @@ class SpreadMonitor:
                         continue
                     if any(r["acquired_raw"] == quantity for r in samples):
                         continue
-                    row = await self.quote(key, notional=budget)
+                    row = await self.quote(key, notional=budget, quote_pair=quote_pair)
                     if row is not None:
                         samples.append(dict(row))
                     if self.rfq_cooldown(self.assets[key[0]], key[1]) and not self.size_refusal(
@@ -1938,7 +2007,7 @@ class SpreadMonitor:
                     ):
                         if any(dec(r["search_budget_usdc"]) == budget for r in samples):
                             continue
-                        row = await self.quote(key, notional=budget)
+                        row = await self.quote(key, notional=budget, quote_pair=quote_pair)
                         if row is not None:
                             samples.append(dict(row))
                             if row["size_feasible"] and (
@@ -1946,7 +2015,7 @@ class SpreadMonitor:
                             ):
                                 best = row
                     # A winning old sample is re-quoted before it becomes the current result.
-                    await self.quote(key, notional=dec(best["search_budget_usdc"]))
+                    await self.quote(key, notional=dec(best["search_budget_usdc"]), quote_pair=quote_pair)
         except TimeoutError:
             event("volume_search_timeout", asset=key[0], direction=key[1])
         finally:

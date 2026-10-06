@@ -380,7 +380,7 @@ async def test_mint_changed_during_quote_discards_result(monitor):
     assert mon.results == {}
 
 
-def test_scheduler_reserves_every_fourth_slot_for_oldest_asset(monitor):
+def test_overdue_asset_gets_next_slot_instead_of_waiting_for_four_hot_quotes(monitor):
     mon, clock = monitor
     mon.assets["COLD.US"] = asset("COLD.US", USDC_MINT, deposit=False)
     mon.assets["WEN.US"] = replace(mon.assets["WEN.US"], deposit_enabled=False)
@@ -389,7 +389,80 @@ def test_scheduler_reserves_every_fourth_slot_for_oldest_asset(monitor):
     mon.attempted[("WEN.US", FORWARD)] = clock() - 10
     mon.attempted[("COLD.US", FORWARD)] = clock() - 200
     mon.estimate = lambda a, direction=None: Decimal("1000") if a.symbol == "WEN.US" else Decimal("-1000")
-    assert [mon.choose()[0] for _ in range(4)] == ["WEN.US", "WEN.US", "WEN.US", "COLD.US"]
+    assert mon.choose() == ("COLD.US", FORWARD)
+
+
+def test_wallet_focus_refreshes_before_point_price_leader_and_expires(monitor):
+    mon, clock = monitor
+    mon.assets["COLD.US"] = asset("COLD.US", USDC_MINT, deposit=False)
+    mon.assets["WEN.US"] = replace(mon.assets["WEN.US"], deposit_enabled=False)
+    mon.chain["COLD.US"] = "verified_unit_mapping"
+    mon.backpack.stock_feed.latest["COLD"] = observed(clock)
+    mon.estimate = lambda a, direction=None: Decimal("1000") if a.symbol == "WEN.US" else Decimal("-1000")
+    assert mon.request_refresh("COLD.US")
+    mon.requested.clear()
+    for symbol in mon.assets:
+        mon.attempted[(symbol, FORWARD)] = clock() - 10
+    assert mon.choose() == ("COLD.US", FORWARD)
+    mon.focus_until["COLD.US"] = clock() - 1
+    assert mon.choose() == ("WEN.US", FORWARD)
+    assert "COLD.US" not in mon.focus_until
+
+
+def test_wallet_focus_has_a_bound_and_does_not_starve_overdue_stocks(monitor):
+    mon, clock = monitor
+    for index in range(10):
+        symbol = f"S{index:02d}.US"
+        mon.assets[symbol] = asset(symbol, USDC_MINT, deposit=False)
+        mon.chain[symbol] = "verified_unit_mapping"
+        mon.backpack.stock_feed.latest[symbol[:-3]] = observed(clock)
+        clock.now += 0.01
+        mon.request_refresh(symbol)
+        mon.attempted[(symbol, FORWARD)] = clock() - 10
+    assert len(mon.focus_until) == 8
+    mon.requested.clear()
+    mon.attempted[("WEN.US", FORWARD)] = clock() - 300
+    mon.attempted[("WEN.US", REVERSE)] = clock() - 300
+    assert mon.choose()[0] == "WEN.US"
+
+
+async def test_sell_availability_is_checked_before_reverse_dex_work(monitor):
+    mon, clock = monitor
+    mon.settings.monitor.rfq_validation = True
+    mon.backpack.auth = object()
+
+    async def inspect(symbol, side, quantity, session):
+        return mon.rfq.result(
+            symbol,
+            side,
+            quantity,
+            session,
+            "available" if side == "Bid" else "unavailable",
+            "rfq_quote_observed" if side == "Bid" else "rfq_insufficient_balance",
+            "6" if side == "Bid" else None,
+        )
+
+    mon.rfq.inspect = AsyncMock(side_effect=inspect)
+    await mon.refresh_rfq_asset(mon.assets["WEN.US"])
+    assert mon.rfq.latest[("WEN.US", "Ask")].reason == "rfq_insufficient_balance"
+    assert mon.choose() == ("WEN.US", FORWARD)
+    mon.attempted[("WEN.US", FORWARD)] = clock()
+    assert mon.choose() is None
+    mon.jupiter.quote_pair.assert_not_awaited()
+
+
+def test_unknown_sell_side_cannot_consume_a_quote_slot_using_only_a_buy_check(monitor):
+    mon, clock = monitor
+    mon.settings.monitor.rfq_validation = True
+    mon.rfq.latest[("WEN.US", "Bid")] = mon.rfq.result(
+        "WEN.US", "Bid", "1", "US_EQUITIES_REGULAR", "available", "rfq_quote_observed", "6"
+    )
+    mon.attempted[("WEN.US", FORWARD)] = clock()
+    assert mon.choose() is None
+    mon.rfq.latest[("WEN.US", "Ask")] = mon.rfq.result(
+        "WEN.US", "Ask", "1", "US_EQUITIES_REGULAR", "available", "rfq_quote_observed", "5.9"
+    )
+    assert mon.choose() == ("WEN.US", REVERSE)
 
 
 def test_missing_batch_price_still_gets_exact_quote_exploration(monitor):

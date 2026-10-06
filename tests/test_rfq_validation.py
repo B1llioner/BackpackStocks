@@ -422,6 +422,8 @@ async def test_rfq_buy_failure_does_not_hide_an_independent_profitable_sell_dire
 
     mon.backpack.rfqs.side_effect = reject_buy
     assert await mon.quote(("WEN.US", FORWARD)) is None
+    await mon.refresh_rfq_asset(mon.assets["WEN.US"])
+    assert mon.rfq.latest[("WEN.US", "Ask")].state == "available"
     assert mon.choose() == ("WEN.US", REVERSE)
     assert not mon.rfq_cooldown(mon.assets["WEN.US"], REVERSE)
     mon.jupiter.quote_pair.return_value = {"outAmount": "18000000", "priceImpact": "0.1"}
@@ -431,7 +433,8 @@ async def test_rfq_buy_failure_does_not_hide_an_independent_profitable_sell_dire
     assert snapshot["rfq_available_assets"] == 0 and snapshot["signal_candidates"] == 1
     assert [pair["direction"] for pair in snapshot["prices"]] == [REVERSE]
     assert "Jup → BP" in mon.text() and "после зачисления" in mon.text()
-    assert [call.kwargs["side"] for call in mon.backpack.submit_rfq.call_args_list] == ["Bid", "Ask"]
+    # Ask availability probe and the later independent exact-size sale price.
+    assert [call.kwargs["side"] for call in mon.backpack.submit_rfq.call_args_list] == ["Bid", "Ask", "Ask"]
     mon.backpack.accept_rfq.assert_not_awaited()
 
 

@@ -48,5 +48,5 @@ metadata_s = 300
 price_batch_s = 10
 quote_refresh_s = 10
 max_quote_age_s = 15
-exploration_s = 120
-concurrency = 2
+exploration_s = 30
+concurrency = 8 # Shared RPC batches; transport rate limits remain unchanged.
