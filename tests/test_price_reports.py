@@ -1,9 +1,12 @@
 import httpx
 import pytest
 import test_telegram
+from test_forward_coverage import coverage_monitor
+from test_indicative_coverage import published
 from test_monitor import asset
 from test_rfq_validation import monitored, observed
 
+from backpack_stocks.indicative_feed import IndicativeFeed
 from backpack_stocks.jupiter_replay import JupiterReplay, ReplayError
 from backpack_stocks.models import STOCK_MINT, USDC_MINT
 from backpack_stocks.monitor import FORWARD, REVERSE, compact_quote
@@ -15,7 +18,7 @@ bot = test_telegram.bot
 engine = test_telegram.engine
 
 
-async def test_negative_spread_keeps_fresh_price_count_and_hides_negative_profit():
+async def test_negative_spread_keeps_fresh_price_count_and_shows_actual_percentages():
     mon, clock = monitored()
     mon.jupiter.quote_pair.return_value = {"outAmount": "90000000", "priceImpact": "0.1"}
     await mon.quote(("WEN.US", FORWARD))
@@ -26,10 +29,53 @@ async def test_negative_spread_keeps_fresh_price_count_and_hides_negative_profit
     assert snapshot["prices"][0]["quote_age_s"] == 3
     assert snapshot["prices"][0]["backpack_price"] == "6.2"
     assert snapshot["prices"][0]["profit_raw"] < 0
-    assert "В 1 актуальных расчётах прибыли нет" in mon.text()
-    assert "BP 6.2 / Jup" not in mon.text()
+    assert "Спред цены: -9.55%; net: -10.48% (-10.48 USDC)" in mon.text()
+    assert "BP 6.2 / Jup" in mon.text()
     assert "УБЫТОК" in mon.prices_text(["WEN.US"])
-    assert "net -" not in mon.text() and "Pool spot" not in mon.text()
+    assert "Объём: 99.999986 USDC" in mon.text() and "Pool spot" not in mon.text()
+
+
+async def test_queued_digest_rerender_removes_expired_percentages(bot):
+    controller, _ = bot
+    controller.queue_replies = True
+    mon, clock = monitored()
+    await mon.quote(("WEN.US", FORWARD))
+    controller.engine.monitor = mon
+    await controller.reply(mon.text(), kind="digest", render=controller.cached_spread_text)
+    _, _, original, kind, render = controller.outbox.get_nowait()
+    assert kind == "digest" and "net: +" in original and "Спред цены:" in render()
+    clock.now += mon.settings.policy.quote_max_age_s
+    current = render()
+    assert "Свежих полных котировок пока нет" in current
+    assert "Спред цены:" not in current and "net:" not in current
+
+
+async def test_positive_public_digest_requires_rfq_and_never_queues_a_confirmed_call(bot):
+    controller, _ = bot
+    controller.queue_replies = True
+    controller.engine.settings.telegram_spread_alerts = True
+    mon, clock = coverage_monitor()
+    feed = IndicativeFeed(clock=clock)
+    feed.tickers.add("WEN")
+    mon.indicative_feed = mon.backpack.indicative_feed = feed
+    mon.jupiter.quote_pair.side_effect = lambda *args, **kwargs: {
+        "outAmount": "2000000",
+        "priceImpact": "0.1",
+        "_observed_at": clock(),
+    }
+    try:
+        await feed.ingest(published(clock))
+        row = await mon.quote(("WEN.US", FORWARD), coverage=True)
+        assert row["profit_raw"] > 0 and not row["backpack_quote_confirmed"]
+        controller.engine.monitor = mon
+        text = mon.text()
+        assert "net: +" in text and "нужна своя RFQ на выбранный объём" in text
+        assert "СПРЕД НАЙДЕН" not in text and "подтверждена" not in text
+        await controller.announce_candidates(mon.snapshot())
+        assert controller.outbox.empty() and mon.snapshot()["signal_candidates"] == 0
+        mon.rfq.inspect.assert_not_awaited()
+    finally:
+        await feed.close()
 
 
 async def test_expired_and_failed_prices_are_display_only_with_timestamp():
@@ -40,6 +86,7 @@ async def test_expired_and_failed_prices_are_display_only_with_timestamp():
     mon.backpack.stock_feed.latest["WEN"] = observed(clock)
     snapshot = mon.snapshot()
     assert not snapshot["rows"] and not snapshot["prices"] and snapshot["fresh_quotes"] == 0
+    assert "Спред цены:" not in mon.text() and "net:" not in mon.text()
     catalog = snapshot["price_catalog"][0]
     assert not catalog["fresh"] and catalog["quote_age_s"] == 9
     text = mon.prices_text()
@@ -92,7 +139,8 @@ async def test_positive_quote_before_slippage_is_not_presented_as_a_profitable_c
     text = mon.prices_text(["WEN.US"])
     assert "УБЫТОК -0.33 USDC" in text and "По quote: +0.17 USDC" in text
     assert "ПРИБЫЛЬ В РАСЧЁТЕ" not in text
-    assert "прибыли нет" in mon.text() and "УБЫТОК" not in mon.text()
+    assert "Спред цены: +0.70%; net: -0.33% (-0.33 USDC)" in mon.text()
+    assert "ПРИБЫЛЬ В РАСЧЁТЕ" not in mon.text()
 
 
 async def test_prices_display_both_directions_without_treating_stock_output_as_usdc():
@@ -110,8 +158,9 @@ async def test_prices_display_both_directions_without_treating_stock_output_as_u
     assert "Jup → BP: ПРИБЫЛЬ В РАСЧЁТЕ" in text
     assert "100 USDC → мин 17.91 шт; продать 17.91 шт за 109.251 USDC" in text
     assert "18000000 USDC" not in text
-    assert "Акции BP → Jup: WEN.US." in mon.text()
-    assert "Акции Jup → BP: WEN.US." in mon.text()
+    assert "WEN.US · BP → Jup" in mon.text()
+    assert "WEN.US · Jup → BP" in mon.text()
+    assert "Продажа на BP после зачисления; цена за время перевода может измениться." in mon.text()
     mon.backpack.accept_rfq.assert_not_awaited()
 
 

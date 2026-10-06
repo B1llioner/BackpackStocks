@@ -336,7 +336,7 @@ class DirectRaydium:
             bridges = await self.bridge_pools()
             if bridges:
                 bridge = bridges[0]
-                response = await self.rpc.accounts([bridge], priority=5)
+                response = await self.rpc.accounts([bridge], priority=10)
                 account = response["value"][0]
                 state = decode_pool(account)
                 if {state["mintA"], state["mintB"]} != {WSOL, USDC_MINT}:
@@ -370,7 +370,9 @@ class DirectRaydium:
         prices: dict[str, list[dict]] = {}
         rejected: Counter = Counter()
         for addresses, entries in chunks:
-            response = await self.rpc.accounts(addresses, parsed=True, priority=5)
+            # Point-price screening selects background exploration. It must
+            # not compete with complete banks for current exact minimum quotes.
+            response = await self.rpc.accounts(addresses, parsed=True, priority=10)
             accounts = dict(zip(addresses, response["value"], strict=True))
             _, timestamp = checked_clock(accounts[CLOCK])
             observed = time.time()

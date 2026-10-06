@@ -433,9 +433,9 @@ async def test_no_public_model_still_gets_exact_minimum_bid_dex_and_displayed_pr
     assert len(snapshot["prices"]) == 1 and snapshot["prices"][0]["backpack_price"] == "6.2"
     assert snapshot["prices"][0]["buy_quantity"] == "0.16"
     text = mon.text(snapshot=snapshot)
-    assert "В 1 проверенных объёмах положительного net не найдено." in text
-    assert "Минимальная законная партия" in text
-    assert "Минимальная законная партия" not in mon.text("WEN.US", snapshot=snapshot)
+    assert "Спред цены: -3.23%; net: -54.88%" in text
+    assert "свежие пары 1/1; BP без свежей цены 0; ждут DEX 0" in text
+    assert "BP без свежей цены" not in mon.text("WEN.US", snapshot=snapshot)
     larger = await mon.quote(key, notional=Decimal("100"))
     assert larger and larger["acquired_raw"] > raw("0.16")
     assert mon.rfq.inspect.await_args.args[2] != "0.16"

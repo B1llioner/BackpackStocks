@@ -53,6 +53,13 @@ async def test_every_report_requotes_displayed_pairs_even_inside_refresh_interva
 
 async def test_report_recalculates_largest_spot_spreads_despite_previous_depth_penalty(monitor):
     mon, clock = monitor
+    mon.settings.monitor.rfq_validation = True
+    mon.backpack.auth = object()
+    mon.rfq.inspect = AsyncMock(
+        side_effect=lambda symbol, side, quantity, session: mon.rfq.result(
+            symbol, side, quantity, session, "available", "rfq_quote_observed", "6"
+        )
+    )
     mon.assets = {f"S{i}.US": asset(f"S{i}.US", str(Pubkey.new_unique())) for i in range(8)}
     mon.chain = {a.symbol: "verified_unit_mapping" for a in mon.assets.values()}
     mon.estimate = lambda a, direction=None: (
@@ -80,6 +87,13 @@ async def test_report_recalculates_largest_spot_spreads_despite_previous_depth_p
 
 async def test_report_has_exact_share_quantities_and_reconciled_forward_costs(monitor):
     mon, _ = monitor
+    mon.settings.monitor.rfq_validation = True
+    mon.backpack.auth = object()
+    mon.rfq.inspect = AsyncMock(
+        side_effect=lambda symbol, side, quantity, session: mon.rfq.result(
+            symbol, side, quantity, session, "available", "rfq_quote_observed", "6"
+        )
+    )
     report = await mon.refresh_report("WEN.US")
     row = next(r for r in report["rows"] if r["direction"] == FORWARD)
     text = "\n".join(quote_details(row))
@@ -89,7 +103,8 @@ async def test_report_has_exact_share_quantities_and_reconciled_forward_costs(mo
     assert "gas 0.03 USDC" in text and "сессия REGULAR" in text
     assert row["proceeds_raw"] - row["cost_raw"] - row["gas_raw"] == row["profit_raw"]
     assert row["settlement_required"] and not row["account_withdrawal_verified"]
-    assert "16.66666 шт за 99.99996" in mon.text(snapshot=report)
+    assert "Объём: 99.99996 USDC" in mon.text(snapshot=report)
+    assert "Спред цены: +5.00%; net: +3.94% (+3.94 USDC)" in mon.text(snapshot=report)
     assert "rfqFilled" not in mon.text(snapshot=report)
 
 

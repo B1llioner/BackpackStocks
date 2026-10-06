@@ -17,7 +17,6 @@ from zoneinfo import ZoneInfo
 from solders.pubkey import Pubkey
 
 from .backpack import Backpack
-from .coverage_reporting import format_forward_coverage
 from .indicative_feed import IndicativeFeed, IndicativeUnavailable
 from .jupiter import Jupiter
 from .jupiter_flow_quotes import JupiterFlowQuotes
@@ -27,6 +26,7 @@ from .proxy import resolve_proxy
 from .rfq_validation import SIZE_REFUSALS, RfqCheck, RfqUnavailable, RfqValidator
 from .sessions import active_session, next_session_open
 from .solana import SolanaRPC, assert_stock_mint
+from .spread_reporting import compact_coverage, format_spreads
 from .stock_books import SPOT_SESSION, BookFill, BookUnavailable, StockBooks
 from .stock_money import StockValueCalculator
 from .volume_search import VolumeSearch
@@ -2634,11 +2634,26 @@ class SpreadMonitor:
                     self.search_pending.discard(key)
             self.adopt_coverage_routes()
             self.sync_primary_banks()
-            while not self.reporting and len(self.pending) < self.settings.monitor.concurrency:
+            concurrency = self.settings.monitor.concurrency
+            local_limit = max(1, concurrency // 2)
+            extra_minimum_lane = (
+                self.settings.mode == "paper"
+                and self.forward_coverage_enabled
+                and self.indicative_feed is not None
+                and isinstance(provider, DirectRaydium)
+                and provider.bank_feed is not None
+            )
+            while not self.reporting and (
+                len(self.pending) < concurrency
+                or extra_minimum_lane
+                and len(self.local_pending) < local_limit
+                and len(self.pending) < concurrency + local_limit
+            ):
                 provider = self.quote_provider
                 from .direct import DirectRaydium
 
-                coverage_key = self.choose_forward_coverage()
+                network_room = len(self.pending) < concurrency
+                coverage_key = self.choose_forward_coverage() if network_room else None
                 initial_started = self.forward_coverage_enabled and all(
                     self.forward_coverage.get(asset.symbol)
                     and self.forward_coverage[asset.symbol].attempted_at
@@ -2647,7 +2662,8 @@ class SpreadMonitor:
                     if self.chain.get(asset.symbol) == "verified_unit_mapping"
                 )
                 reserve_search = (
-                    initial_started
+                    network_room
+                    and initial_started
                     and not self.search_pending
                     and (
                         not self.coverage_turn
@@ -2669,7 +2685,7 @@ class SpreadMonitor:
                 if (
                     isinstance(provider, DirectRaydium)
                     and provider.bank_feed is not None
-                    and len(self.local_pending) < max(1, self.settings.monitor.concurrency // 2)
+                    and len(self.local_pending) < local_limit
                 ):
                     now = self.clock()
                     possible = [
@@ -2687,6 +2703,15 @@ class SpreadMonitor:
                         if local_version is not None and local_version != self.local_inputs.get(key):
                             local_keys.append((key, local_version))
                 ready_minimum = [row for row in local_keys if plans[row[0]].get("minimum_coverage")]
+                if not network_room:
+                    # These extra slots only consume already owned public
+                    # inputs and ready banks. The cached minimum path has no
+                    # account request, route discovery or network fallback.
+                    ready_minimum = [
+                        row for row in ready_minimum if plans[row[0]]["backpack_source"] == "indicative"
+                    ]
+                    if not extra_minimum_lane or not ready_minimum:
+                        break
                 prefer_minimum = bool(ready_minimum and (self.local_turn or reserved_selection is None))
                 if prefer_minimum:
                     local_keys = ready_minimum
@@ -2710,7 +2735,7 @@ class SpreadMonitor:
                     None
                     if prefer_minimum
                     else reserved_selection
-                    or (self.choose() if not local_keys or not self.local_turn else None)
+                    or (self.choose() if network_room and (not local_keys or not self.local_turn) else None)
                 )
                 if local_keys and selected is None:
                     assert isinstance(provider, DirectRaydium)
@@ -3740,44 +3765,25 @@ class SpreadMonitor:
                 "report_keys" not in snapshot or (r["asset"], r["direction"]) in keys
             )
 
-        rows = [
-            r
-            for r in snapshot["rows"]
-            if selected(r) and r["fresh"] and r.get("signal_eligible", True) and r.get("profit_raw", 0) > 0
-        ][:5]
-        rejected = [
-            r
-            for r in snapshot["rows"]
-            if selected(r) and r["fresh"] and r.get("signal_eligible") is False and r.get("profit_raw", 0) > 0
-        ]
         prices = [r for r in snapshot.get("prices", []) if selected(r)]
-        lines = []
-        if rows:
-            lines.append(f"Положительных расчётов после расходов: {len(rows)}")
-            for row in rows:
-                lines.extend(["", *compact_quote(row)])
-        else:
-            lines.append(
-                "Положительный расчёт не прошёл проверки."
-                if rejected
-                else f"В {len(prices)} проверенных объёмах положительного net не найдено."
-                if prices and snapshot.get("forward_coverage", {}).get("enabled")
-                else f"В {len(prices)} актуальных расчётах прибыли нет."
-                if prices
-                else "Свежих полных котировок пока нет. Прибыль не оценена."
-            )
-            for row in rejected[:5]:
+        lines = format_spreads(prices)
+        if not lines:
+            lines = ["Свежих полных котировок пока нет. Спред и net не оценены."]
+            rejected = [
+                row
+                for row in snapshot.get("rows", [])
+                if selected(row)
+                and row.get("fresh")
+                and row.get("profit_raw", 0) > 0
+                and row.get("signal_eligible") is False
+                and row.get("candidate_blocks")
+            ]
+            for row in rejected[:3]:
                 lines.append(f"{row['asset']}: {block_text(row['candidate_blocks'])}")
-            if prices:
-                lines.append(f"Обновлено {quote_time(max(pair['updated_at'] for pair in prices))}")
-                lines.append(
-                    "Объёмы, результат и оба направления: /prices" + (f" {symbol}" if symbol else "")
-                )
-            else:
-                session_message = session_text(snapshot)
-                if session_message:
-                    lines.append(session_message)
-            if symbol and not prices:
+            session_message = session_text(snapshot)
+            if session_message:
+                lines.append(session_message)
+            if symbol:
                 reasons = sorted(
                     {
                         code
@@ -3794,14 +3800,11 @@ class SpreadMonitor:
                 )
                 if retry > 0:
                     lines.append(f"Повтор запроса {symbol} через {retry:.0f}с.")
-        if symbol is None and snapshot.get("forward_coverage", {}).get("enabled"):
-            lines.extend(["", *format_forward_coverage(snapshot)])
-        label = dex_label({"quote_backend": self.quote_backend})
-        for direction, direction_label in ((FORWARD, f"BP → {label}"), (REVERSE, f"{label} → BP")):
-            tickers = sorted({r["asset"] for r in prices if r["direction"] == direction})
-            lines.append(
-                f"Акции {direction_label}: {', '.join(tickers) if tickers else 'нет свежих расчётов'}."
-            )
+        if symbol is None:
+            coverage_lines = compact_coverage(snapshot)
+            if coverage_lines:
+                lines.extend(["", *coverage_lines])
+        lines.extend(["", "Подробнее: /monitor · Все объёмы: /prices" + (f" {symbol}" if symbol else "")])
         return "\n".join(lines)
 
     def prices_text(
