@@ -1,4 +1,5 @@
 import asyncio
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -7,11 +8,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from solders.pubkey import Pubkey
-from test_direct import fixture
+from test_direct import ROOT, fixture
 from test_monitor import asset, observed
 from test_monitor import monitor as monitor_fixture
 
-from backpack_stocks.direct import DirectRaydium
+from backpack_stocks.direct import CLOCK, DirectRaydium
 from backpack_stocks.models import STOCK_MINT, USDC_MINT, Settings
 from backpack_stocks.monitor import FORWARD, REVERSE, SpreadMonitor, quote_details
 from backpack_stocks.quote_batch import QuoteAccountBatch
@@ -482,4 +483,44 @@ async def test_background_direct_quotes_share_rpc_batches_and_keep_concurrency_b
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await mon.close()
+        await router.close()
+
+
+@pytest.mark.parametrize("broken", [None, "mint", "stale_clock"])
+async def test_cpmm_batch_uses_catalogue_addresses_with_missing_oracle_and_validates_fresh_bank(
+    monkeypatch, broken
+):
+    saved = json.loads((ROOT / "tests/fixtures/direct-raydium/cpmm-direct-quote.json").read_text())
+    q = saved["quote"]
+    monkeypatch.setattr("backpack_stocks.direct.time.time", lambda: q["_observed_at"])
+    final = saved["rpc_records"][-1]
+    rows = dict(zip(final["addresses"], final["result"]["value"], strict=True))
+    if broken == "mint":
+        rows[q["inputMint"]]["data"]["parsed"]["info"]["decimals"] += 1
+    elif broken == "stale_clock":
+        rows[CLOCK]["data"]["parsed"]["info"]["unixTimestamp"] -= 60
+    rpc = SimpleNamespace(
+        accounts=AsyncMock(
+            side_effect=lambda refs, **kw: {
+                "context": {"slot": q["contextSlot"]},
+                "value": [rows.get(a) for a in refs],
+            }
+        )
+    )
+    router = DirectRaydium(Settings(dex_backend="raydium"), rpc)
+    hint = dict(q["_direct"]["state"])
+    hint.pop("observation", None)
+    router.pool_catalog[q["pool"]] = {"program": q["_direct"]["program"], "snapshot": {"state": hint}}
+    batch = QuoteAccountBatch(rpc)
+    try:
+        call = router.pool_quote(q["pool"], q["inputMint"], q["outputMint"], int(q["inAmount"]), _rpc=batch)
+        if broken:
+            with pytest.raises(ValueError):
+                await call
+        else:
+            result = await call
+            assert result["outAmount"] == q["outAmount"]
+        assert rpc.accounts.await_count == 1
+    finally:
+        await batch.close()
         await router.close()

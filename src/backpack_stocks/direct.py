@@ -572,7 +572,11 @@ class DirectRaydium:
         if _rpc is not None and hint.get("program") == CPMM:
             # Catalogue state supplies addresses only. The complete fresh bank
             # below verifies the pool, routing, mints, vaults, fees and Clock.
-            initial_state = hint["snapshot"]["state"]
+            initial_state = {
+                **hint["snapshot"]["state"],
+                "observation": hint["snapshot"]["state"].get("observation")
+                or pda(CPMM, b"observation", bytes(Pubkey.from_string(pool))),
+            }
             program = CPMM
         else:
             refs = [pool, bitmap] if _rpc is not None and hint.get("program") == CLMM else [pool]
