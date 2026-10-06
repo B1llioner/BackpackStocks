@@ -9,11 +9,14 @@ import time
 class PriorityLimiter:
     """Pace request starts; execution requests precede queued background monitoring reads."""
 
-    def __init__(self, interval: float, *, categories: dict[str, float] | None = None):
+    def __init__(
+        self, interval: float, *, categories: dict[str, float] | None = None, oldest_every: int | None = None
+    ):
         self.interval, self.last = interval, 0.0
         self.base_interval = interval
         self.adaptive_backoffs = 0
         self.categories = categories or {}
+        self.oldest_every = oldest_every
         self.category_last: dict[str, float] = {}
         self.blocked_until = 0.0
         self.category_blocked: dict[str, float] = {}
@@ -70,6 +73,14 @@ class PriorityLimiter:
                 await asyncio.sleep(min(1, max(0, delay)))
                 continue
             item = min(ready)
+            if (
+                self.oldest_every
+                and self.admitted % self.oldest_every == self.oldest_every - 1
+                and item[0] > 0
+            ):
+                # Preserve execution priority zero, but reserve bounded turns
+                # for older monitoring/history requests under sustained load.
+                item = min(ready, key=lambda queued: queued[1])
             self.queue.remove(item)
             heapq.heapify(self.queue)
             _, _, future, category = item
@@ -94,6 +105,7 @@ class PriorityLimiter:
         return {
             "interval_s": self.interval,
             "base_interval_s": self.base_interval,
+            "oldest_every": self.oldest_every,
             "adaptive_backoffs": self.adaptive_backoffs,
             "categories_s": self.categories,
             "cooldown_s": max(0, self.blocked_until - time.monotonic()),

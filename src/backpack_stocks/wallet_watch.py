@@ -281,6 +281,13 @@ class WalletWatcher:
             (wallet, signature),
         ).rowcount
         if inserted:
+            event(
+                "wallet_transaction_queued",
+                component="wallet_watch",
+                signature=signature,
+                phase="stream",
+                state="pending",
+            )
             self.decode_ready.set()
 
     def update_stream(self) -> None:
@@ -400,6 +407,7 @@ class WalletWatcher:
         target = account["target_head"] or (signatures[0] if signatures else None)
         completed = head is None or stop < len(signatures) or len(signatures) < config["limit"]
         db = self.journal.db
+        queued: list[tuple[str, bool]] = []
         db.execute("BEGIN IMMEDIATE")
         try:
             added = db.execute("SELECT added FROM wallets WHERE address=?", (account["wallet"],)).fetchone()[
@@ -408,10 +416,12 @@ class WalletWatcher:
             for index, signature in enumerate(signatures[:stop]):
                 block_time = rows[index].get("blockTime")
                 historical = head is None and (type(block_time) is not int or block_time < added)
-                db.execute(
+                inserted = db.execute(
                     "INSERT OR IGNORE INTO transactions(wallet,signature,historical) VALUES(?,?,?)",
                     (account["wallet"], signature, int(historical)),
-                )
+                ).rowcount
+                if inserted:
+                    queued.append((signature, historical))
             db.execute(
                 "UPDATE accounts SET head=?,crawl_before=?,target_head=?,checked=? WHERE address=?",
                 (
@@ -426,13 +436,29 @@ class WalletWatcher:
         except BaseException:
             db.execute("ROLLBACK")
             raise
+        for signature, historical in queued:
+            event(
+                "wallet_transaction_queued",
+                component="wallet_watch",
+                signature=signature,
+                phase="http",
+                state="historical" if historical else "pending",
+            )
+        if queued:
+            self.decode_ready.set()
 
     def correlation(self, record: dict) -> dict:
+        stocks = [leg for leg in record["legs"] if leg["asset"]]
+        if record["kind"] not in {"sale", "purchase"}:
+            refresh_requested = False
+            if self.monitor is not None:
+                for symbol in sorted({leg["asset"] for leg in stocks}):
+                    refresh_requested = self.monitor.request_refresh(symbol) or refresh_requested
+            return {"reason": "not_a_swap", "refresh_requested": refresh_requested}
         if self.monitor is None:
             return {"reason": "monitor_unavailable"}
         from .monitor import FORWARD, REVERSE
 
-        stocks = [leg for leg in record["legs"] if leg["asset"]]
         if len(stocks) != 1:
             return {"reason": "no_single_stock"}
         symbol = stocks[0]["asset"]
@@ -505,7 +531,10 @@ class WalletWatcher:
         ).fetchall()
         for item in pending:
             try:
-                tx = await self.rpc.transaction(item["signature"], priority=20)
+                # New activity must precede continuous pool-bank refreshes (5),
+                # while execution reads (0) and historical backfill keep their lanes.
+                priority = 20 if item["historical"] else 3
+                tx = await self.rpc.transaction(item["signature"], priority=priority)
                 if tx is None:
                     raise ValueError("Transaction not yet available")
                 record = decode_activity(tx, item["wallet"], item["signature"], self.stocks())
@@ -676,12 +705,17 @@ def activity_text(record: dict) -> str:
                 )
     if record["kind"] == "sale":
         lines.append("Цена покупки в Backpack неизвестна; прибыль не подтверждена.")
+    elif record["kind"] in {"transfer", "paired_transfer", "backpack_receipt"} and any(
+        leg["asset"] for leg in record["legs"]
+    ):
+        lines.append("Перевод акций; цена покупки/продажи в этой транзакции не зафиксирована.")
     if record["fee_lamports"] or record["sol_transfer_lamports"]:
         lines.append(
             f"Сетевая комиссия {Decimal(record['fee_lamports']) / 10**9:f} SOL; "
             f"исходящие переводы {Decimal(record['sol_transfer_lamports']) / 10**9:f} SOL."
         )
-    reason = record.get("correlation", {}).get("reason")
+    # Old journal entries may contain a swap comparison attached to a transfer.
+    reason = record.get("correlation", {}).get("reason") if record["kind"] in {"sale", "purchase"} else None
     if reason == "no_contemporaneous_quote":
         context = record["correlation"]
         if context.get("within_budget") is False:

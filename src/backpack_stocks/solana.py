@@ -84,7 +84,12 @@ class SolanaRPC:
     ):
         self.url, self.proxy = url, proxy
         self.http = transport or Transport(
-            url, interval=interval, byte_budget=75_000_000, max_response_bytes=2_000_000, proxy=proxy
+            url,
+            interval=interval,
+            byte_budget=75_000_000,
+            max_response_bytes=2_000_000,
+            proxy=proxy,
+            oldest_every=4,
         )
         self.sequence = 0
 

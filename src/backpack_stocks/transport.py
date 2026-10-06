@@ -53,6 +53,7 @@ class Transport:
         max_response_bytes: int = 5_000_000,
         proxy: str | None = None,
         rate_headers: bool = False,
+        oldest_every: int | None = None,
     ):
         proxy = checked_proxy(proxy)
         if client is not None and proxy is not None:
@@ -67,7 +68,7 @@ class Transport:
             proxy=proxy,
             limits=httpx.Limits(max_connections=8, max_keepalive_connections=8, keepalive_expiry=60),
         )
-        self.limiter = PriorityLimiter(interval)
+        self.limiter = PriorityLimiter(interval, oldest_every=oldest_every)
         self.in_flight = asyncio.Semaphore(8)
         self.responses_429 = 0
         self.byte_budget, self.max_response_bytes = byte_budget, max_response_bytes

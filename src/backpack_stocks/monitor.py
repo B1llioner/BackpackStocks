@@ -224,8 +224,11 @@ class SpreadMonitor:
         self.focus_until: dict[str, float] = {}
         self.local_plans: dict[tuple[str, str], dict] = {}
         self.local_after: dict[tuple[str, str], float] = {}
+        self.local_inputs: dict[tuple[str, str], tuple] = {}
         self.local_calculations = 0
         self.local_pending: set[tuple[str, str]] = set()
+        self.local_turn = True
+        self.rfq_after: dict[tuple[str, str], float] = {}
         self.updated = asyncio.Event()
         self.stock_values = StockValueCalculator()
         self.retry_after: dict[tuple[str, str], float] = {}
@@ -267,9 +270,12 @@ class SpreadMonitor:
                 for direction in (FORWARD, REVERSE):
                     self.local_plans.pop((symbol, direction), None)
                     self.local_after.pop((symbol, direction), None)
+                    self.local_inputs.pop((symbol, direction), None)
                     self.price_history.pop((symbol, direction), None)
                     self.volume_search.samples.pop((symbol, direction), None)
                     self.volume_search.turns.pop((symbol, direction), None)
+                for side in ("Bid", "Ask"):
+                    self.rfq_after.pop((symbol, side), None)
         chain = {}
         entries = list(found.values())
         for start in range(0, len(entries), 100):
@@ -796,85 +802,133 @@ class SpreadMonitor:
             return False
         return bool(check and check.reason in SIZE_REFUSALS)
 
-    async def refresh_rfq_asset(self, asset: Asset) -> None:
+    def owned_rfq_plan(self, asset: Asset, side: str) -> dict | None:
+        from .direct import DirectRaydium
+
+        direction = FORWARD if side == "Bid" else REVERSE
+        plan = self.local_plans.get((asset.symbol, direction))
+        if (
+            isinstance(self.quote_provider, DirectRaydium)
+            and plan
+            and plan["mint"] == asset.mint
+            and plan["backpack_source"] == "rfq"
+            and self.chain.get(asset.symbol) == "verified_unit_mapping"
+            and (side == "Bid" or asset.deposit_enabled)
+        ):
+            try:
+                if plan["backpack_session"] == self.quantity_session(self.observation(asset)):
+                    return plan
+            except (ValueError, KeyError, TypeError):
+                pass
+        return None
+
+    def rfq_deadline(self, asset: Asset, side: str) -> float:
+        """Price renewals share the bounded queue with both availability sides."""
+        plan = self.owned_rfq_plan(asset, side)
+        check = self.rfq.latest.get((asset.symbol, side))
+        if plan:
+            quantity = plan["acquired_raw"] if side == "Bid" else plan["sellable_raw"]
+            normalized = format(ui(quantity, asset.decimals).normalize(), "f")
+            exact = self.rfq.cache.get(
+                (
+                    asset.symbol,
+                    side,
+                    normalized,
+                    plan["backpack_session"],
+                )
+            )
+            # A refusal keeps its existing eligibility cooldown. A fresh probe
+            # for another quantity cannot postpone this plan's price renewal.
+            if (
+                check is None
+                or check.state == "available"
+                or check.reason in SIZE_REFUSALS
+                and dec(check.quantity) != dec(normalized)
+            ):
+                check = exact
+        deadline = (
+            (check.retry_at if plan and check.state == "available" else check.eligibility_until)
+            if check
+            else 0
+        )
+        return max(deadline, self.rfq_after.get((asset.symbol, side), 0))
+
+    async def refresh_rfq_asset(self, asset: Asset, side: str | None = None) -> None:
+        sides = [side] if side else ["Bid", "Ask"] if asset.deposit_enabled else ["Bid"]
+        for current in sides:
+            if current == "Ask" and (not asset.deposit_enabled or self.books.available(asset.symbol)):
+                continue
+            await self.refresh_rfq_side(asset, current)
+        self.updated.set()
+
+    async def refresh_rfq_side(self, asset: Asset, side: str) -> None:
         session = "UNAVAILABLE"
+        owned = False
+        check = None
         try:
             obs = self.observation(asset)
             session = self.quantity_session(obs)
-            await self.validated_buy(asset, obs)
+            plan = self.owned_rfq_plan(asset, side)
+            if plan and plan["backpack_session"] == session:
+                owned = True
+                check = await self.confirm_local_price(
+                    (asset.symbol, FORWARD if side == "Bid" else REVERSE), plan
+                )
+            elif side == "Bid":
+                _, _, _, check = await self.validated_buy(asset, obs)
+            else:
+                rules = self.quantity_rules(asset, obs)
+                step = dec(rules["stepSize"])
+                quantity = max(dec(rules["minQuantity"]), asset.deposit_min)
+                quantity = (quantity / step).to_integral_value(rounding=ROUND_CEILING) * step
+                if quantity > dec(rules["maxQuantity"]):
+                    raise RfqUnavailable("rfq_invalid_quantity")
+                check = await self.rfq.check(asset.symbol, str(quantity), session, side="Ask")
         except asyncio.CancelledError:
             raise
         except Exception as error:
             if not self.books.available(asset.symbol):
-                self.failures[(asset.symbol, FORWARD)] = error_code(error)
-                self.failure_causes[(asset.symbol, FORWARD)] = [error_code(error)]
-            previous = self.rfq.latest.get((asset.symbol, "Bid"))
-            if previous is None or self.clock() >= previous.eligibility_until:
-                check = self.rfq.result(asset.symbol, "Bid", "0", session, "unknown", error_code(error))
-                self.rfq.latest[(asset.symbol, "Bid")] = check
+                key = asset.symbol, FORWARD if side == "Bid" else REVERSE
+                self.failures[key] = error_code(error)
+                self.failure_causes[key] = [error_code(error)]
+            previous = self.rfq.latest.get((asset.symbol, side))
+            if not owned and (previous is None or self.clock() >= previous.eligibility_until):
+                check = self.rfq.result(asset.symbol, side, "0", session, "unknown", error_code(error))
+                self.rfq.latest[(asset.symbol, side)] = check
+        self.rfq_after[(asset.symbol, side)] = (
+            (check.retry_at if owned and check and check.state == "available" else check.eligibility_until)
+            if check
+            else self.clock() + self.settings.monitor.quote_refresh_s
+        )
         if self.assets.get(asset.symbol) != asset:
             self.rfq.invalidate(asset.symbol)
-        elif asset.deposit_enabled and not self.books.available(asset.symbol):
-            # Establish sell-side availability before spending DEX/RPC work.
-            # A usable Bid never substitutes for an Ask; the exact sale later
-            # still checks its own quantity and current price.
-            previous_sell = self.rfq.latest.get((asset.symbol, "Ask"))
-            if previous_sell is None or self.clock() >= previous_sell.eligibility_until:
-                try:
-                    obs = self.observation(asset)
-                    rules = self.quantity_rules(asset, obs)
-                    step = dec(rules["stepSize"])
-                    quantity = max(dec(rules["minQuantity"]), asset.deposit_min)
-                    quantity = (quantity / step).to_integral_value(rounding=ROUND_CEILING) * step
-                    if quantity > dec(rules["maxQuantity"]):
-                        raise RfqUnavailable("rfq_invalid_quantity")
-                    await self.rfq.check(asset.symbol, str(quantity), self.quantity_session(obs), side="Ask")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    self.rfq.latest[(asset.symbol, "Ask")] = self.rfq.result(
-                        asset.symbol, "Ask", "0", session, "unknown", error_code(error)
-                    )
-        self.updated.set()
 
     async def rfq_loop(self) -> None:
-        """Refresh each stock at its eligibility deadline without overlapping probes."""
+        """Refresh due sides fairly; only owned available plans use price deadlines."""
         await self.discovery_ready.wait()
         await self.refresh_external_prices()
-        pending: dict[str, asyncio.Task] = {}
+        pending: dict[tuple[str, str], asyncio.Task] = {}
         try:
             while True:
-                for symbol, task in list(pending.items()):
+                for key, task in list(pending.items()):
                     if task.done():
                         await task
-                        pending.pop(symbol)
+                        pending.pop(key)
                 available = sorted(
-                    self.assets.values(),
-                    key=lambda a: (
-                        self.rfq.latest[(a.symbol, "Bid")].checked_at
-                        if (a.symbol, "Bid") in self.rfq.latest
-                        else 0,
-                        a.symbol,
-                    ),
+                    (self.rfq_deadline(asset, side), asset.symbol, side)
+                    for asset in self.assets.values()
+                    if self.chain.get(asset.symbol) == "verified_unit_mapping"
+                    for side in ("Bid", "Ask")
+                    if side == "Bid" or asset.deposit_enabled and not self.books.available(asset.symbol)
                 )
-                for asset in available:
+                for deadline, symbol, side in available:
                     if len(pending) >= self.settings.monitor.rfq_concurrency:
                         break
-                    previous = self.rfq.latest.get((asset.symbol, "Bid"))
-                    previous_sell = self.rfq.latest.get((asset.symbol, "Ask"))
-                    if asset.symbol in pending or self.chain.get(asset.symbol) != "verified_unit_mapping":
+                    if self.clock() < deadline or any(key[0] == symbol for key in pending):
                         continue
-                    if (
-                        previous
-                        and self.clock() < previous.eligibility_until
-                        and (
-                            not asset.deposit_enabled
-                            or self.books.available(asset.symbol)
-                            or (previous_sell and self.clock() < previous_sell.eligibility_until)
-                        )
-                    ):
-                        continue
-                    pending[asset.symbol] = asyncio.create_task(self.refresh_rfq_asset(asset))
+                    pending[(symbol, side)] = asyncio.create_task(
+                        self.refresh_rfq_asset(self.assets[symbol], side)
+                    )
                 await asyncio.sleep(0.5)
         finally:
             for task in pending.values():
@@ -1044,52 +1098,105 @@ class SpreadMonitor:
         )
         return sellable, obs, check, None, proceeds
 
-    async def confirm_local_price(self, key: tuple[str, str], plan: dict) -> None:
-        """Indicative prices may request a check, but never produce an alert."""
+    async def confirm_local_price(self, key: tuple[str, str], plan: dict) -> RfqCheck | None:
+        """Renew a plan's exact side and size through the fair RFQ queue."""
         from .direct import DirectRaydium
 
         provider = self.quote_provider
         if not isinstance(provider, DirectRaydium) or not self.settings.monitor.rfq_validation:
-            return
+            return None
         asset = self.assets[key[0]]
         if self.chain.get(asset.symbol) != "verified_unit_mapping" or asset.mint != plan["mint"]:
-            return
+            return None
         forward = key[1] == FORWARD
         obs = self.rfq_observation(asset, key[1])
         session = self.quantity_session(obs)
-        quote = await provider.cached_plan_quote(
-            asset.mint if forward else USDC_MINT,
-            USDC_MINT if forward else asset.mint,
-            plan["acquired_raw"] - raw(asset.fee, asset.decimals) if forward else plan["input_raw"],
-            plan=plan["dex_plan"],
-            priority=10,
-        )
-        output = min(
-            int(quote["otherAmountThreshold"]),
-            int(quote["outAmount"]) * (10000 - self.settings.policy.slippage_bps) // 10000,
-        )
-        quantity = plan["acquired_raw"] if forward else self.sale_quantity(asset, obs, output)
-        value = self.stock_values.value(
-            quantity,
-            asset.decimals,
-            obs.ask if forward else obs.bid,
-            self.settings.policy.backpack_fee_bps,
-            buy=forward,
-        )
-        estimated_net = (
-            output - value - plan["gas_raw"] if forward else value - plan["cost_raw"] - plan["gas_raw"]
-        )
-        if estimated_net <= 0:
-            return
+        if session != plan["backpack_session"]:
+            raise RfqUnavailable("rfq_session_unavailable")
+        if forward:
+            quantity = plan["acquired_raw"]
+            if self.sale_quantity(asset, obs, quantity) != quantity:
+                raise RfqUnavailable("rfq_invalid_quantity")
+        else:
+            # A new DEX bank can change the actual sale size. Derive it locally
+            # before spending this side's one bounded RFQ renewal slot.
+            quote = await provider.cached_plan_quote(
+                USDC_MINT, asset.mint, plan["input_raw"], plan=plan["dex_plan"], priority=10
+            )
+            output = min(
+                int(quote["otherAmountThreshold"]),
+                int(quote["outAmount"]) * (10000 - self.settings.policy.slippage_bps) // 10000,
+            )
+            if ui(output, asset.decimals) < asset.deposit_min:
+                raise RfqUnavailable("rfq_invalid_quantity")
+            quantity = self.sale_quantity(asset, obs, output)
         event(
             "local_price_check_requested",
             asset=asset.symbol,
             direction=key[1],
             side="Bid" if forward else "Ask",
         )
-        await self.rfq.check(
+        return await self.rfq.check(
             asset.symbol, str(ui(quantity, asset.decimals)), session, side="Bid" if forward else "Ask"
         )
+
+    def local_input_version(self, key: tuple[str, str], plan: dict) -> tuple | None:
+        """Schedule a ready input combination once, including failed local probes."""
+        from .direct import DirectRaydium
+
+        provider = self.quote_provider
+        asset = self.assets.get(key[0])
+        if (
+            not isinstance(provider, DirectRaydium)
+            or provider.bank_feed is None
+            or asset is None
+            or plan["mint"] != asset.mint
+            or self.chain.get(asset.symbol) != "verified_unit_mapping"
+            or (key[1] == REVERSE and not asset.deposit_enabled)
+        ):
+            return None
+        try:
+            versions = provider.bank_versions(plan["dex_plan"])
+            if not versions:
+                return None
+            current = []
+            for pool, source, target, _, _ in versions:
+                bank = provider.bank_feed.peek((pool, source, target, 10))
+                if bank is None:
+                    return None
+                current.append((pool, source, target, bank["response"]["context"]["slot"], bank["observed"]))
+            source_version: tuple
+            if plan["backpack_source"] == "spot":
+                if not self.books.available(asset.symbol):
+                    return None
+                depth = self.books.depths[asset.symbol]
+                capacity = self.books.capacities.get((asset.symbol, "Bid"))
+                source_version = (depth.timestamp, depth.update_id, self.books.fee_at, capacity)
+            elif plan["backpack_source"] == "rfq":
+                session = self.quantity_session(self.observation(asset))
+                if session != plan["backpack_session"]:
+                    return None
+                side = "Bid" if key[1] == FORWARD else "Ask"
+                quantity = format(ui(plan["acquired_raw"], asset.decimals).normalize(), "f")
+                exact = [
+                    (cache_key, check.checked_at, check.price)
+                    for cache_key, check in self.rfq.cache.items()
+                    if cache_key[0] == asset.symbol
+                    and cache_key[1] == side
+                    and cache_key[3] == session
+                    and (side == "Ask" or cache_key[2] == quantity)
+                    and check.usable(self.clock())
+                ]
+                if not exact:
+                    return None
+                # Ask quantity is determined by the newly repriced DEX output;
+                # local_sell still requires that exact quantity after repricing.
+                source_version = tuple(sorted(exact))
+            else:
+                return None
+            return tuple(current), source_version
+        except (ValueError, KeyError, TypeError, ArithmeticError):
+            return None
 
     def book_fields(self, asset: Asset, fill: BookFill) -> dict:
         capacity = self.books.capacities[(asset.symbol, "Bid")] if fill.side == "Bid" else None
@@ -1390,6 +1497,14 @@ class SpreadMonitor:
             self.price_history[key] = pair
             self.completed_quotes += 1
             self.local_plans[key] = {**self.results[key], "dex_plan": quote}
+            if rfq_check is not None:
+                self.rfq_after.pop((symbol, "Bid" if direction == FORWARD else "Ask"), None)
+            if isinstance(
+                self.quote_provider, DirectRaydium
+            ) and self.quote_provider.bank_versions_are_current(self.results[key]["dex_bank_versions"]):
+                version = self.local_input_version(key, self.local_plans[key])
+                if version is not None:
+                    self.local_inputs[key] = version
             self.local_calculations += local_plan is not None
             self.retry_after.pop(key, None)
             self.quote_failures.pop(key, None)
@@ -1448,16 +1563,6 @@ class SpreadMonitor:
             raise
         except Exception as error:
             if local_plan is not None:
-                if isinstance(error, RfqUnavailable) and error.code == "rfq_check_stale":
-                    try:
-                        await self.confirm_local_price(key, local_plan)
-                    except Exception as check_error:
-                        event(
-                            "local_price_check_unavailable",
-                            asset=symbol,
-                            direction=direction,
-                            code=error_code(check_error),
-                        )
                 event("local_quote_unavailable", asset=symbol, direction=direction, code=error_code(error))
                 return None
             code = error_code(error)
@@ -1572,13 +1677,14 @@ class SpreadMonitor:
                 provider = self.quote_provider
                 from .direct import DirectRaydium
 
+                local_keys = []
                 if (
                     isinstance(provider, DirectRaydium)
                     and provider.bank_feed is not None
-                    and len(self.local_pending) < 8
+                    and len(self.local_pending) < max(1, self.settings.monitor.concurrency // 2)
                 ):
                     now = self.clock()
-                    local_keys = [
+                    possible = [
                         key
                         for key, plan in self.local_plans.items()
                         if key not in self.pending
@@ -1588,25 +1694,33 @@ class SpreadMonitor:
                         and plan["backpack_source"] in {"rfq", "spot"}
                         and ("_direct" in plan["dex_plan"] or "_direct_route" in plan["dex_plan"])
                     ]
-                    # Prefer changed input banks; identical snapshots need no
-                    # repeated network work and never receive a new timestamp.
-                    if local_keys:
-                        key = min(local_keys, key=lambda k: self.local_after.get(k, 0))
-                        self.local_after[key] = now + 1
-                        plan = self.local_plans[key]
-                        self.local_pending.add(key)
-                        self.pending[key] = asyncio.create_task(
-                            self.quote(
-                                key,
-                                notional=dec(plan["search_budget_usdc"]),
-                                local_plan=plan,
-                                quote_pair=partial(provider.cached_plan_quote, plan=plan["dex_plan"]),
-                            )
+                    for key in possible:
+                        local_version = self.local_input_version(key, self.local_plans[key])
+                        if local_version is not None and local_version != self.local_inputs.get(key):
+                            local_keys.append((key, local_version))
+                # Alternate dispatches and bound local in-flight work so cold
+                # exploration retains slots even when many banks change at once.
+                selected = self.choose() if not local_keys or not self.local_turn else None
+                if local_keys and selected is None:
+                    assert isinstance(provider, DirectRaydium)
+                    key, local_version = min(local_keys, key=lambda row: self.local_after.get(row[0], 0))
+                    self.local_after[key] = self.clock() + 1
+                    self.local_inputs[key] = local_version
+                    plan = self.local_plans[key]
+                    self.local_pending.add(key)
+                    self.local_turn = False
+                    self.pending[key] = asyncio.create_task(
+                        self.quote(
+                            key,
+                            notional=dec(plan["search_budget_usdc"]),
+                            local_plan=plan,
+                            quote_pair=partial(provider.cached_plan_quote, plan=plan["dex_plan"]),
                         )
-                        continue
-                selected = self.choose()
+                    )
+                    continue
                 if selected is None:
                     break
+                self.local_turn = True
                 if selected in self.optimization_requested:
                     self.optimization_requested.discard(selected)
                     self.pending[selected] = asyncio.create_task(

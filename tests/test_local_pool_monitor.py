@@ -43,6 +43,7 @@ async def test_real_cpmm_bank_local_reprice_has_no_rpc_and_never_restamps_old_da
         bank = await router._pool_bank(
             q["pool"], q["inputMint"], q["outputMint"], int(q["inAmount"]), _rpc=feed
         )
+        assert bank["observed"] == now[0]  # Acquisition time is distinct from the protocol Clock.
         feed.ready[(q["pool"], q["inputMint"], q["outputMint"], 10)] = bank
         rpc.accounts.reset_mock()
         now[0] = bank["observed"] + age
@@ -95,6 +96,12 @@ async def test_clmm_refresh_uses_one_complete_new_bank_and_still_rejects_bad_vau
         else:
             refreshed = await router._pool_bank(*key[:3], int(q["inAmount"]), priority=10, _rpc=feed)
             assert refreshed is not bank and refreshed["arrays"] == bank["arrays"]
+            assert refreshed["arrays_verified"]
+            router.worker.call = AsyncMock(wraps=router.worker.call)
+            first = await router.quote_bank(*key[:3], int(q["inAmount"]), refreshed)
+            second = await router.quote_bank(*key[:3], int(q["inAmount"]), refreshed)
+            assert first["outAmount"] == second["outAmount"]
+            assert [call.args[0]["op"] for call in router.worker.call.await_args_list] == ["quote", "quote"]
         rpc.accounts.assert_awaited_once()
         assert rpc.accounts.call_args.kwargs["parsed"] is True
         assert set(rpc.accounts.call_args.args[0]) == set(bank["accounts"])
@@ -133,7 +140,7 @@ async def test_local_route_reprices_split_remainder_and_exact_sol_intermediate()
 async def test_background_banks_refresh_without_a_quote_and_invalidate_failed_data(monkeypatch):
     now = [100.0]
     monkeypatch.setattr("backpack_stocks.pool_bank_feed.time.time", lambda: now[0])
-    feed = PoolBankFeed(None, 8)
+    feed = PoolBankFeed(None, 8, timer=lambda: now[0])
     key = "pool", STOCK_MINT, USDC_MINT, 10
     producer = AsyncMock(side_effect=lambda: {"observed": now[0]})
     try:
@@ -156,7 +163,7 @@ async def test_background_bank_refresh_precedes_discovery_without_raising_rpc_ra
     now = [100.0]
     monkeypatch.setattr("backpack_stocks.pool_bank_feed.time.time", lambda: now[0])
     rpc = SimpleNamespace(accounts=AsyncMock(return_value={"context": {"slot": 200}, "value": [None]}))
-    feed = PoolBankFeed(rpc, 8)
+    feed = PoolBankFeed(rpc, 8, timer=lambda: now[0])
     key = "pool", STOCK_MINT, USDC_MINT, 10
 
     async def producer():

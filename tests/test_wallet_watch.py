@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 from types import SimpleNamespace
@@ -7,10 +8,11 @@ import pytest
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 
+from backpack_stocks.limiter import PriorityLimiter
 from backpack_stocks.models import STOCK_MINT, TOKEN, TOKEN_2022, USDC_MINT
 from backpack_stocks.solana import SolanaRPC
 from backpack_stocks.wallet_stream import WalletStream
-from backpack_stocks.wallet_watch import TITAN, WalletJournal, WalletWatcher, decode_activity
+from backpack_stocks.wallet_watch import TITAN, WalletJournal, WalletWatcher, activity_text, decode_activity
 
 WALLET = str(Pubkey.from_bytes(bytes([7]) * 32))
 OTHER = str(Pubkey.from_bytes(bytes([8]) * 32))
@@ -20,7 +22,9 @@ def sig(number=1):
     return str(Signature.from_bytes(bytes([number]) * 64))
 
 
-async def test_stream_signature_is_durable_deduplicated_and_decoded_without_http_sweep(journal):
+async def test_stream_signature_is_durable_deduplicated_and_decoded_without_http_sweep(journal, monkeypatch):
+    queued = []
+    monkeypatch.setattr("backpack_stocks.wallet_watch.event", lambda name, **fields: queued.append(name))
     rpc = SimpleNamespace(transaction=AsyncMock(return_value=transaction()))
     monitor = SimpleNamespace(
         assets={"PUSA.US": SimpleNamespace(mint=STOCK_MINT, symbol="PUSA.US")},
@@ -37,10 +41,15 @@ async def test_stream_signature_is_durable_deduplicated_and_decoded_without_http
     stream.ingest(payload, {42: WALLET})
     stream.ingest(payload, {42: WALLET})
     assert journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    assert queued == ["wallet_transaction_queued"]
     assert watcher.decode_ready.is_set()
     await watcher.decode_pending()
     assert len(journal.notifications()) == 1
     assert journal.notifications()[0]["correlation"]["refresh_requested"] is False
+    stream.ingest(payload, {42: WALLET})
+    await watcher.decode_pending()
+    rpc.transaction.assert_awaited_once_with(sig(), priority=3)
+    assert queued.count("wallet_transaction_queued") == 1
 
 
 def test_unknown_stream_subscription_cannot_enqueue_wallet_activity(journal):
@@ -148,7 +157,11 @@ async def test_rpc_reader_accepts_transaction_v1_without_sending():
     assert arguments["mutation"] is False and arguments["priority"] == 20
 
 
-async def test_initial_import_is_quiet_but_new_transactions_after_registration_notify(journal):
+async def test_initial_import_is_quiet_but_new_transactions_after_registration_notify(journal, monkeypatch):
+    queued = []
+    monkeypatch.setattr(
+        "backpack_stocks.wallet_watch.event", lambda name, **fields: queued.append((name, fields))
+    )
     rpc = SimpleNamespace(
         call=AsyncMock(
             return_value=[{"signature": sig(2), "blockTime": 1001}, {"signature": sig(), "blockTime": 900}]
@@ -159,9 +172,72 @@ async def test_initial_import_is_quiet_but_new_transactions_after_registration_n
     await watcher.poll_account(account)
     rows = journal.db.execute("SELECT signature,historical FROM transactions ORDER BY rowid").fetchall()
     assert [tuple(row) for row in rows] == [(sig(2), 0), (sig(), 1)]
+    assert [(name, fields["signature"], fields["phase"], fields["state"]) for name, fields in queued] == [
+        ("wallet_transaction_queued", sig(2), "http", "pending"),
+        ("wallet_transaction_queued", sig(), "http", "historical"),
+    ]
+    assert watcher.decode_ready.is_set()
+    watcher.decode_ready.clear()
     account = journal.db.execute("SELECT * FROM accounts").fetchone()
     await watcher.poll_account(account)
     assert journal.db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 2
+    assert len(queued) == 2
+    assert not watcher.decode_ready.is_set()
+
+
+async def test_recent_activity_precedes_backfill_with_bounded_rpc_batches(journal):
+    journal.db.execute("INSERT INTO transactions(wallet,signature,historical) VALUES(?,?,1)", (WALLET, sig()))
+    rpc = SimpleNamespace(transaction=AsyncMock(side_effect=lambda signature, **_: transaction(signature)))
+    watcher = WalletWatcher(journal, rpc, None, clock=lambda: 1005)
+    for number in range(2, 7):
+        watcher.queue_signature(WALLET, sig(number))
+        watcher.queue_signature(WALLET, sig(number))
+
+    await watcher.decode_pending()
+    assert [(call.args[0], call.kwargs["priority"]) for call in rpc.transaction.await_args_list] == [
+        (sig(number), 3) for number in range(2, 6)
+    ]
+    assert journal.db.execute("SELECT COUNT(*) FROM transactions WHERE state='pending'").fetchone()[0] == 2
+
+    await watcher.decode_pending()
+    assert [(call.args[0], call.kwargs["priority"]) for call in rpc.transaction.await_args_list[4:]] == [
+        (sig(6), 3),
+        (sig(), 20),
+    ]
+    assert journal.db.execute("SELECT COUNT(*) FROM transactions WHERE state='pending'").fetchone()[0] == 0
+    await watcher.decode_pending()
+    assert rpc.transaction.await_count == 6
+
+
+async def test_recent_decoder_progresses_before_queued_pool_reads_and_after_execution(journal):
+    limiter = PriorityLimiter(0.001)
+    limiter.defer(0.02)
+    admitted = []
+
+    async def read(name, priority):
+        await limiter.acquire(priority)
+        admitted.append(name)
+
+    async def get_transaction(signature, *, priority):
+        await read(signature, priority)
+        return transaction(signature)
+
+    journal.db.execute("INSERT INTO transactions(wallet,signature,historical) VALUES(?,?,1)", (WALLET, sig()))
+    watcher = WalletWatcher(journal, SimpleNamespace(transaction=get_transaction), None, clock=lambda: 1005)
+    watcher.queue_signature(WALLET, sig(2))
+    tasks = [asyncio.create_task(read(f"pool-{number}", 5)) for number in range(6)]
+    tasks.extend([asyncio.create_task(read("execution", 0)), asyncio.create_task(watcher.decode_pending())])
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks), 1)
+        assert admitted[:2] == ["execution", sig(2)]
+        assert admitted[2:-1] == [f"pool-{number}" for number in range(6)]
+        assert admitted[-1] == sig()
+        assert journal.db.execute("SELECT COUNT(*) FROM transactions WHERE state='pending'").fetchone()[0] == 0
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await limiter.close()
 
 
 async def test_pagination_keeps_old_cursor_until_all_signatures_are_durable(journal):
@@ -252,6 +328,55 @@ def test_correlation_rejects_quote_received_after_trade(journal):
     assert context["reason"] == "quote_quantity_mismatch"
     assert context["monitor_quantity_raw"] == 100_000_000
     assert context["wallet_quantity_raw"] == 1_999_840_000
+
+
+@pytest.mark.parametrize("kind", ["transfer", "paired_transfer", "backpack_receipt", "failed"])
+def test_non_swap_refreshes_known_stock_without_comparing_quotes(journal, kind):
+    monitor = SimpleNamespace(request_refresh=lambda symbol: symbol == "PUSA.US")
+    watcher = WalletWatcher(journal, None, monitor)
+    record = decode_activity(transaction(), WALLET, sig(), {STOCK_MINT: "PUSA.US"})
+    record["kind"] = kind
+    assert watcher.correlation(record) == {"reason": "not_a_swap", "refresh_requested": True}
+    watcher.monitor = None
+    assert watcher.correlation(record) == {"reason": "not_a_swap", "refresh_requested": False}
+    record["legs"] = []
+    watcher.monitor = monitor
+    assert watcher.correlation(record) == {"reason": "not_a_swap", "refresh_requested": False}
+
+
+@pytest.mark.parametrize("kind", ["transfer", "paired_transfer", "backpack_receipt"])
+@pytest.mark.parametrize("reason", ["recent_monitor_quote", "no_contemporaneous_quote", "quote_quantity_mismatch"])
+def test_transfer_text_ignores_historical_swap_comparison(kind, reason):
+    record = decode_activity(transaction(), WALLET, sig(), {STOCK_MINT: "PUSA.US"})
+    record["kind"] = kind
+    record["correlation"] = {
+        "reason": reason,
+        "monitor_cost_raw": 100_000_000,
+        "monitor_profit_raw": -1_000_000,
+        "monitor_quantity_raw": 1_000_000,
+        "wallet_quantity_raw": 1_999_840_000,
+        "stock_decimals": 6,
+        "refresh_requested": True,
+    }
+    text = activity_text(record)
+    assert "Перевод акций; цена покупки/продажи в этой транзакции не зафиксирована." in text
+    assert "Наш расчёт" not in text
+    assert "net" not in text
+    assert "Нет котировки на момент сделки" not in text
+    assert "Ближайший расчёт" not in text
+    assert f"https://solscan.io/tx/{sig()}" in text
+
+
+def test_swap_text_retains_monitor_comparison():
+    record = decode_activity(transaction(), WALLET, sig(), {STOCK_MINT: "PUSA.US"})
+    record["correlation"] = {
+        "reason": "recent_monitor_quote",
+        "monitor_cost_raw": 100_000_000,
+        "monitor_profit_raw": -1_000_000,
+    }
+    text = activity_text(record)
+    assert "Наш расчёт: объём 100 USDC; net -1 USDC." in text
+    assert "прибыль не подтверждена" in text
 
 
 def test_wallet_registration_rejects_invalid_addresses(journal):

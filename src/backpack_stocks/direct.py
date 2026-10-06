@@ -738,8 +738,8 @@ class DirectRaydium:
         if state["status"] & (16 if program == CLMM else 4):
             raise ValueError("Pool swaps disabled")
         epoch, timestamp = checked_clock(accounts[CLOCK])
-        if isinstance(_rpc, PoolBankFeed):
-            observed = min(observed, timestamp)
+        # Clock is protocol time for epoch/fees/opening, not the wall-clock
+        # acquisition time of this complete atomic RPC account bank.
         if abs(time.time() - timestamp) > 30:
             raise ValueError("RPC finalized bank is too old")
         pool_raw = base64.b64decode(accounts[pool]["data"][0], validate=True)
@@ -781,12 +781,14 @@ class DirectRaydium:
                 if reserve <= 0:
                     raise ValueError("Empty effective reserves")
                 state["reserve" + side] = str(reserve)
-        if reuse:
+        if program == CLMM:
             account_bytes(accounts[bitmap], CLMM, "TickArrayBitmapExtension", 1832)
             params = self._worker_params(pool, accounts[pool], accounts[bitmap], source)
             params["maxArrays"] = array_limit
             current_arrays = (await self.worker.call({**params, "op": "addresses"}))["addresses"]
             if current_arrays != arrays:
+                if not reuse:
+                    raise ValueError("Directional tick bitmap changed during refresh")
                 # Price movement changed the required tick accounts. Discover
                 # and fetch the entire new bank before it can become usable.
                 return await self._pool_bank(
@@ -810,6 +812,7 @@ class DirectRaydium:
             "observed": observed,
             "response": response,
             "array_limit": array_limit,
+            "arrays_verified": program == CLMM,
         }
 
     async def pool_quote(
@@ -889,9 +892,10 @@ class DirectRaydium:
         else:
             params = self._worker_params(pool, accounts[pool], accounts[bitmap], source)
             params["maxArrays"] = bank.get("array_limit", self.settings.direct.max_tick_arrays)
-            expected = (await self.worker.call({**params, "op": "addresses"}))["addresses"]
-            if expected != arrays:
-                raise ValueError("Directional tick bitmap changed during refresh")
+            if not bank.get("arrays_verified"):
+                expected = (await self.worker.call({**params, "op": "addresses"}))["addresses"]
+                if expected != arrays:
+                    raise ValueError("Directional tick bitmap changed during refresh")
             incoming = state["transferFeeA" if direction else "transferFeeB"]
             outgoing = state["transferFeeB" if direction else "transferFeeA"]
             net = amount - min(incoming["maximum"], (amount * incoming["bps"] + 9999) // 10000)

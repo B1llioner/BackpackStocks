@@ -15,23 +15,32 @@ REFRESHING: ContextVar[bool] = ContextVar("refreshing_pool_bank", default=False)
 
 
 class PoolBankFeed(QuoteAccountBatch):
-    def __init__(self, rpc, max_age: float):
+    def __init__(self, rpc, max_age: float, *, timer: Callable[[], float] = time.monotonic):
         super().__init__(rpc, commitment="confirmed")
         self.max_age = max_age
         self.producers: dict[BankKey, Callable[[], Awaitable[dict]]] = {}
         self.ready: dict[BankKey, dict] = {}
         self.hot: dict[BankKey, float] = {}
         self.retry_at: dict[BankKey, float] = {}
-        self.limit = asyncio.Semaphore(16)
+        self.received_at: dict[BankKey, float] = {}
+        self.timer = timer
+        # Allow a whole monitoring round to reach the coalescer. RPC traffic
+        # remains bounded by its unchanged transport pace and eight connections.
+        self.limit = asyncio.Semaphore(128)
         self.changed = asyncio.Event()
         self.refreshed = 0
         self.local_quotes = 0
         self.runner = asyncio.create_task(self.refresh_loop())
 
+    def remember(self, key: BankKey, bank: dict) -> None:
+        if self.ready.get(key) is not bank:
+            self.ready[key] = bank
+            self.received_at[key] = self.timer()
+
     def peek(self, key: BankKey) -> dict | None:
         task = self.pool_banks.get(key)
         if task and task.done() and not task.cancelled() and task.exception() is None:
-            self.ready[key] = task.result()
+            self.remember(key, task.result())
         bank = self.ready.get(key)
         return bank if bank and 0 <= time.time() - bank["observed"] < self.max_age else None
 
@@ -39,12 +48,19 @@ class PoolBankFeed(QuoteAccountBatch):
         if key not in self.producers and len(self.producers) >= 1024:
             raise ValueError("Pool bank cache exceeds bound")
         self.producers[key] = producer
+        bank = self.peek(key)
+        if (
+            bank is not None
+            and time.time() - bank["observed"] < max_age
+            and self.timer() - self.received_at.get(key, float("-inf")) < self.max_age / 4
+        ):
+            return bank
         try:
             bank = await super().pool_snapshot(key, producer, max_age)
         except Exception:
             self.ready.pop(key, None)
             raise
-        self.ready[key] = bank
+        self.remember(key, bank)
         return bank
 
     async def accounts(self, addresses, *, parsed=False, min_slot=None, priority=0):
@@ -64,6 +80,7 @@ class PoolBankFeed(QuoteAccountBatch):
     async def refresh_loop(self):
         while True:
             now = time.time()
+            elapsed = self.timer()
             self.hot = {key: until for key, until in self.hot.items() if until > now}
             due = []
             for key in self.hot:
@@ -71,19 +88,21 @@ class PoolBankFeed(QuoteAccountBatch):
                 bank = self.ready.get(key)
                 if task and not task.done():
                     continue
-                if now < self.retry_at.get(key, 0):
+                if elapsed < self.retry_at.get(key, 0):
                     continue
-                if bank and 0 <= now - bank["observed"] < self.max_age / 4:
+                # Chain Clock may already lag wall time by several seconds on
+                # receipt. It measures price freshness, not read scheduling.
+                if bank and elapsed - self.received_at.get(key, float("-inf")) < self.max_age / 4:
                     continue
                 due.append(key)
-            for key in sorted(due, key=lambda k: self.ready.get(k, {}).get("observed", 0)):
+            for key in sorted(due, key=lambda k: self.received_at.get(k, 0)):
 
                 async def refresh(key=key):
                     token = REFRESHING.set(True)
                     try:
                         async with self.limit:
                             bank = await self.producers[key]()
-                        self.ready[key] = bank
+                        self.remember(key, bank)
                         self.refreshed += 1
                         self.changed.set()
                         return bank
@@ -91,7 +110,7 @@ class PoolBankFeed(QuoteAccountBatch):
                         raise
                     except Exception as error:
                         self.ready.pop(key, None)
-                        self.retry_at[key] = time.time() + 5
+                        self.retry_at[key] = self.timer() + 5
                         event("pool_bank_refresh_blocked", pool=key[0], code=error_code(error))
                         raise
                     finally:
