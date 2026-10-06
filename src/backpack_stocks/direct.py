@@ -18,9 +18,10 @@ from pathlib import Path
 from solders.instruction import AccountMeta, Instruction
 from solders.pubkey import Pubkey
 
-from .clmm_worker import ClmmWorker
+from .clmm_worker import ClmmCalculationError, ClmmWorker
 from .models import ATA, STOCK_MINT, TOKEN, TOKEN_2022, USDC_MINT, Settings, dec
 from .observability import MARKET_BLOCKS, QuoteUnavailable, error_code, event
+from .pool_bank_feed import PoolBankFeed
 from .pool_catalog import CLOCK, SYSVAR, mint_capabilities, transfer_fee_profile
 from .pool_compute import PoolCalculator, PreparedCpmmPools
 from .pool_math import spot_b_per_a
@@ -33,6 +34,14 @@ from .swap_guard import COMPUTE, SYSTEM
 
 MEMO = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
 WSOL = "So11111111111111111111111111111111111111112"
+
+
+class LocalQuoteNotReady(QuoteUnavailable):
+    code = "pool_bank_not_ready"
+
+    def __init__(self):
+        super().__init__([self.code])
+        self.code = "pool_bank_not_ready"
 
 
 def pda(program: str, *seeds: bytes) -> str:
@@ -173,6 +182,8 @@ class DirectRaydium:
         self.gas_discovery_lock = asyncio.Lock()
         self.discovery_lock = asyncio.Lock()
         self.discovery_checked: dict[str, float] = {}
+        self.bank_feed: PoolBankFeed | None = None
+        self.array_hints: dict[tuple[str, str], int] = {}
 
     def update_assets(self, assets: list[dict]) -> None:
         for row in assets:
@@ -303,6 +314,7 @@ class DirectRaydium:
             "via_sol": self.settings.direct.via_sol,
             "split_pools": self.settings.direct.split_pools,
             "sol_assets": len(self.sol_candidates),
+            "bank_feed": self.bank_feed.status() if self.bank_feed else None,
         }
 
     async def close(self) -> None:
@@ -452,12 +464,84 @@ class DirectRaydium:
         return await self.quote(amount)
 
     @asynccontextmanager
-    async def batch_quotes(self):
-        batch = QuoteAccountBatch(self.rpc)
+    async def batch_quotes(self, *, continuous: bool = False):
+        batch: QuoteAccountBatch
+        if continuous:
+            self.bank_feed = PoolBankFeed(self.rpc, self.settings.policy.quote_max_age_s)
+            batch = self.bank_feed
+        else:
+            batch = QuoteAccountBatch(self.rpc)
         try:
             yield partial(self.quote_pair, _rpc=batch)
         finally:
+            if continuous:
+                self.bank_feed = None
             await batch.close()
+
+    async def cached_plan_quote(
+        self, source: str, target: str, amount: int, *, plan: dict, priority: int = 10
+    ) -> dict:
+        """Reprice the proven route tree locally with exact intermediate credits."""
+        from .direct_routes import combine
+
+        feed = self.bank_feed
+        if feed is None or plan["inputMint"] != source or plan["outputMint"] != target:
+            raise LocalQuoteNotReady()
+
+        async def reprice(node, units):
+            legs = node.get("_direct_route")
+            if not legs:
+                bank = feed.peek((node["pool"], node["inputMint"], node["outputMint"], priority))
+                if bank is None:
+                    raise LocalQuoteNotReady()
+                return await self.quote_bank(node["pool"], node["inputMint"], node["outputMint"], units, bank)
+            split = all(
+                (leg["inputMint"], leg["outputMint"]) == (node["inputMint"], node["outputMint"])
+                for leg in legs
+            )
+            values: list[dict] = []
+            remaining = units
+            for index, leg in enumerate(legs):
+                if split:
+                    credit = (
+                        remaining
+                        if index == len(legs) - 1
+                        else units * int(leg["inAmount"]) // int(node["inAmount"])
+                    )
+                    remaining -= credit
+                else:
+                    credit = units if not values else int(values[-1]["outAmount"])
+                values.append(await reprice(leg, credit))
+            return combine(values, sequential=not split)
+
+        result = await reprice(plan, amount)
+        result.update(_local_only=True, direct_execution_supported=False, _request_started_at=time.time())
+        feed.promote(result, priority)
+        feed.local_quotes += 1
+        return result
+
+    @staticmethod
+    def bank_versions(plan: dict) -> list[list]:
+        legs = plan.get("_direct_route")
+        if legs:
+            return [version for leg in legs for version in DirectRaydium.bank_versions(leg)]
+        if "pool" not in plan:
+            return []
+        return [
+            [plan["pool"], plan["inputMint"], plan["outputMint"], plan["contextSlot"], plan["_observed_at"]]
+        ]
+
+    def bank_versions_are_current(self, versions: list[list], priority: int = 10) -> bool:
+        feed = self.bank_feed
+        if feed is None:
+            return True
+        if not versions:
+            return False
+        for pool, source, target, slot, observed in versions:
+            bank = feed.peek((pool, source, target, priority))
+            if not bank or observed != bank["observed"] or slot != bank["response"]["context"]["slot"]:
+                return False
+        return True
 
     async def quote_pair(
         self,
@@ -488,7 +572,10 @@ class DirectRaydium:
                     )
             scope = QuoteAccountBatch(_rpc)
             try:
-                return await composed_quote(self, source, target, amount, priority, scope)
+                composed = await composed_quote(self, source, target, amount, priority, scope)
+                if isinstance(_rpc, PoolBankFeed):
+                    _rpc.promote(composed, priority)
+                return composed
             finally:
                 await scope.close()
         pools = self.candidates.get(stock, [])
@@ -561,15 +648,35 @@ class DirectRaydium:
         *,
         priority: int = 0,
         _rpc: QuoteAccountBatch | None = None,
+        _max_arrays: int | None = None,
+        _reuse_bank: bool = True,
     ) -> dict:
         if type(amount) is not int or not 0 < amount < 2**63 or source == target:
             raise ValueError("Invalid exact-in amount/pair")
         rpc = _rpc if _rpc is not None else self.rpc
+        array_limit = _max_arrays or (
+            self.array_hints.get((pool, source), self.settings.direct.max_tick_arrays)
+            if isinstance(_rpc, PoolBankFeed)
+            else self.settings.direct.max_tick_arrays
+        )
         bitmap = pda(CLMM, b"pool_tick_array_bitmap_extension", bytes(Pubkey.from_string(pool)))
         hint = self.pool_catalog.get(pool, {})
         min_slot = None
         bitmap_response = None
-        if _rpc is not None and hint.get("program") == CPMM:
+        previous = (
+            _rpc.ready.get((pool, source, target, priority))
+            if isinstance(_rpc, PoolBankFeed) and _reuse_bank
+            else None
+        )
+        reuse = bool(previous and previous["program"] == CLMM and previous["array_limit"] == array_limit)
+        if reuse:
+            assert previous is not None
+            # Known addresses only: every account and the directional bitmap
+            # are fetched and validated again in one fresh bank below.
+            initial_state = previous["state"]
+            program = CLMM
+            min_slot = previous["response"]["context"]["slot"]
+        elif _rpc is not None and hint.get("program") == CPMM:
             # Catalogue state supplies addresses only. The complete fresh bank
             # below verifies the pool, routing, mints, vaults, fees and Clock.
             initial_state = {
@@ -591,14 +698,15 @@ class DirectRaydium:
             initial_state["mintB"],
         }:
             raise ValueError("Direct pool pair/program mismatch")
-        arrays: list[str] = []
-        if program == CLMM:
+        arrays: list[str] = list(previous["arrays"]) if reuse and previous is not None else []
+        if program == CLMM and not reuse:
             response = bitmap_response or await rpc.accounts(
                 [pool, bitmap], min_slot=min_slot, priority=priority
             )
             min_slot = max(min_slot or 0, response["context"]["slot"])
             account_bytes(response["value"][1], CLMM, "TickArrayBitmapExtension", 1832)
             params = self._worker_params(pool, response["value"][0], response["value"][1], source)
+            params["maxArrays"] = array_limit
             arrays = (await self.worker.call({**params, "op": "addresses"}))["addresses"]
             if not arrays or len(arrays) > self.settings.direct.max_tick_arrays:
                 raise ValueError("No bounded directional CLMM ticks")
@@ -630,6 +738,8 @@ class DirectRaydium:
         if state["status"] & (16 if program == CLMM else 4):
             raise ValueError("Pool swaps disabled")
         epoch, timestamp = checked_clock(accounts[CLOCK])
+        if isinstance(_rpc, PoolBankFeed):
+            observed = min(observed, timestamp)
         if abs(time.time() - timestamp) > 30:
             raise ValueError("RPC finalized bank is too old")
         pool_raw = base64.b64decode(accounts[pool]["data"][0], validate=True)
@@ -671,6 +781,24 @@ class DirectRaydium:
                 if reserve <= 0:
                     raise ValueError("Empty effective reserves")
                 state["reserve" + side] = str(reserve)
+        if reuse:
+            account_bytes(accounts[bitmap], CLMM, "TickArrayBitmapExtension", 1832)
+            params = self._worker_params(pool, accounts[pool], accounts[bitmap], source)
+            params["maxArrays"] = array_limit
+            current_arrays = (await self.worker.call({**params, "op": "addresses"}))["addresses"]
+            if current_arrays != arrays:
+                # Price movement changed the required tick accounts. Discover
+                # and fetch the entire new bank before it can become usable.
+                return await self._pool_bank(
+                    pool,
+                    source,
+                    target,
+                    amount,
+                    priority=priority,
+                    _rpc=_rpc,
+                    _max_arrays=_max_arrays,
+                    _reuse_bank=False,
+                )
         validate_auxiliary(pool, program, state, accounts, arrays)
         return {
             "state": state,
@@ -681,6 +809,7 @@ class DirectRaydium:
             "timestamp": timestamp,
             "observed": observed,
             "response": response,
+            "array_limit": array_limit,
         }
 
     async def pool_quote(
@@ -695,24 +824,52 @@ class DirectRaydium:
     ) -> dict:
         if type(amount) is not int or not 0 < amount < 2**63 or source == target:
             raise ValueError("Invalid exact-in amount/pair")
-        fetch = partial(self._pool_bank, pool, source, target, amount, priority=priority, _rpc=_rpc)
         banks = _rpc
         if (
             _rpc is not None
             and isinstance(_rpc.rpc, QuoteAccountBatch)
-            and {source, target} == {WSOL, USDC_MINT}
+            and (isinstance(_rpc.rpc, PoolBankFeed) or {source, target} == {WSOL, USDC_MINT})
         ):
-            # Stocks keep request-local banks. Shared SOL/USDC bridge banks are
-            # amount-independent and retain their original observation time.
+            # The monitor shares all amount-independent banks; ordinary quote
+            # scopes share only SOL/USDC bridge banks, preserving original age.
             banks = _rpc.rpc
+        fetch = partial(self._pool_bank, pool, source, target, amount, priority=priority, _rpc=banks)
         bank = (
             await banks.pool_snapshot(
                 (pool, source, target, priority), fetch, self.settings.policy.quote_max_age_s
             )
-            if banks is not None and self.settings.direct.via_sol
+            if banks is not None and (self.settings.direct.via_sol or isinstance(banks, PoolBankFeed))
             else await fetch()
         )
+        try:
+            return await self.quote_bank(pool, source, target, amount, bank)
+        except ClmmCalculationError as error:
+            if (
+                error.code != "insufficient_tick_coverage"
+                or bank.get("array_limit", 8) >= self.settings.direct.max_tick_arrays
+            ):
+                raise
+            # A larger amount may need more ticks than the fast refresh bank.
+            # Fetch full coverage; never return a partially filled amount.
+            bank = await self._pool_bank(
+                pool,
+                source,
+                target,
+                amount,
+                priority=priority,
+                _rpc=banks,
+                _max_arrays=self.settings.direct.max_tick_arrays,
+            )
+            return await self.quote_bank(pool, source, target, amount, bank)
+
+    async def quote_bank(self, pool: str, source: str, target: str, amount: int, bank: dict) -> dict:
         state, program, accounts = bank["state"], bank["program"], bank["accounts"]
+        if (
+            type(amount) is not int
+            or not 0 < amount < 2**63
+            or {source, target} != {state["mintA"], state["mintB"]}
+        ):
+            raise ValueError("Invalid local bank amount/pair")
         arrays, bitmap = list(bank["arrays"]), bank["bitmap"]
         timestamp, observed, response = bank["timestamp"], bank["observed"], bank["response"]
         direction = source == state["mintA"]
@@ -731,6 +888,7 @@ class DirectRaydium:
             )
         else:
             params = self._worker_params(pool, accounts[pool], accounts[bitmap], source)
+            params["maxArrays"] = bank.get("array_limit", self.settings.direct.max_tick_arrays)
             expected = (await self.worker.call({**params, "op": "addresses"}))["addresses"]
             if expected != arrays:
                 raise ValueError("Directional tick bitmap changed during refresh")
@@ -753,6 +911,9 @@ class DirectRaydium:
             # All arrays were validated for the quote; only consumed arrays belong
             # in the transaction, where unnecessary keys can exceed the packet cap.
             arrays = used_arrays
+            self.array_hints[(pool, source)] = min(
+                self.settings.direct.max_tick_arrays, max(2, len(arrays) + 1)
+            )
             gross = int(result["output"])
             output = gross - min(outgoing["maximum"], (gross * outgoing["bps"] + 9999) // 10000)
             if not 4295048017 < int(result["sqrtPrice"]) < 79226673521066979257578248090:

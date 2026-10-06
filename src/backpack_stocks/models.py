@@ -125,7 +125,7 @@ class MonitorPolicy(StrictModel):
     quote_refresh_s: float = Field(default=5, ge=1)
     max_quote_age_s: float = Field(default=8, ge=1)
     exploration_s: float = Field(default=120, ge=5)
-    concurrency: int = Field(default=2, ge=1, le=8)
+    concurrency: int = Field(default=2, ge=1, le=16)
 
     @model_validator(mode="after")
     def valid(self) -> MonitorPolicy:

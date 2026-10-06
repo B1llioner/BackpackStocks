@@ -106,9 +106,17 @@ class SolanaRPC:
         return result["result"]
 
     async def accounts(
-        self, addresses: list[str], *, parsed: bool = False, min_slot: int | None = None, priority: int = 0
+        self,
+        addresses: list[str],
+        *,
+        parsed: bool = False,
+        min_slot: int | None = None,
+        priority: int = 0,
+        commitment: str = "finalized",
     ) -> dict:
-        config: dict = {"encoding": "jsonParsed" if parsed else "base64", "commitment": "finalized"}
+        if commitment not in {"finalized", "confirmed"}:
+            raise ValueError("Unsupported account read commitment")
+        config: dict = {"encoding": "jsonParsed" if parsed else "base64", "commitment": commitment}
         if min_slot is not None:
             config["minContextSlot"] = min_slot
         return await self.call("getMultipleAccounts", [addresses, config], priority=priority)

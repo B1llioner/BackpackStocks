@@ -91,6 +91,11 @@ class RfqValidator:
             else None
         )
 
+    def cached_exact(self, symbol: str, quantity: str, session: str, side: str = "Bid") -> RfqCheck | None:
+        key = symbol, side, format(dec(quantity).normalize(), "f"), session
+        cached = self.cache.get(key)
+        return cached if cached and cached.usable(self.clock()) else None
+
     async def check(self, symbol: str, quantity: str, session: str, *, side: str = "Bid") -> RfqCheck:
         if side not in {"Bid", "Ask"} or dec(quantity) <= 0:
             raise ValueError("Invalid RFQ validation request")
@@ -108,9 +113,16 @@ class RfqValidator:
             else:
                 async with self.limit:
                     result = await self.inspect(symbol, side, quantity, session)
-            # One entry per size is sufficient; do not accumulate changing fractional sizes forever.
-            self.cache = {k: v for k, v in self.cache.items() if k[:2] != key[:2]}
             self.cache[key] = result
+            # Keep a small exact-size window so a discovery probe does not
+            # discard the still-valid price used by the local pool calculator.
+            same_side = sorted(
+                (k for k in self.cache if k[:2] == key[:2]),
+                key=lambda k: self.cache[k].checked_at,
+                reverse=True,
+            )
+            for old in same_side[4:]:
+                self.cache.pop(old)
             self.latest[(symbol, side)] = result
             event(
                 "rfq_check",

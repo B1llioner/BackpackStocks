@@ -22,8 +22,9 @@ class AccountRequest:
 class QuoteAccountBatch:
     """Each pool's entire account group stays in one RPC bank, at most 100 addresses."""
 
-    def __init__(self, rpc: SolanaRPC | QuoteAccountBatch):
+    def __init__(self, rpc: SolanaRPC | QuoteAccountBatch, *, commitment: str | None = None):
         self.rpc = rpc
+        self.commitment = commitment
         self.waiting: list[AccountRequest] = []
         self.tasks: set[asyncio.Task] = set()
         self.scheduled = False
@@ -66,25 +67,29 @@ class QuoteAccountBatch:
 
     async def flush(self) -> None:
         # Let independent pools reach the same read stage, including local tick discovery.
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
         requests, self.waiting = self.waiting, []
         self.scheduled = False
         groups: list[list[AccountRequest]] = []
         for request in requests:
             if request.future.done():
                 continue
-            group = groups[-1] if groups else []
-            refs = {a for r in group for a in r.addresses}
-            if group and (
-                request.parsed != group[0].parsed
-                or request.priority != group[0].priority
-                or len(refs | set(request.addresses)) > 100
-            ):
+            group = next(
+                (
+                    group
+                    for group in groups
+                    if request.parsed == group[0].parsed
+                    and request.priority == group[0].priority
+                    and len({a for r in group for a in r.addresses} | set(request.addresses)) <= 100
+                ),
+                None,
+            )
+            if group is None:
                 group = []
-            if not group:
                 groups.append(group)
             group.append(request)
-        for group in groups:
+
+        async def read_group(group: list[AccountRequest]) -> None:
             addresses = list(dict.fromkeys(a for r in group for a in r.addresses))
             slots = [r.min_slot for r in group if r.min_slot is not None]
             try:
@@ -93,6 +98,7 @@ class QuoteAccountBatch:
                     parsed=group[0].parsed,
                     min_slot=max(slots) if slots else None,
                     priority=group[0].priority,
+                    **({"commitment": self.commitment} if self.commitment is not None else {}),
                 )
                 accounts = dict(zip(addresses, response["value"], strict=True))
                 if slots and response["context"]["slot"] < max(slots):
@@ -110,10 +116,13 @@ class QuoteAccountBatch:
                     if not request.future.done():
                         request.future.set_exception(error)
             except asyncio.CancelledError:
-                for remaining in groups:
-                    for request in remaining:
-                        request.future.cancel()
+                for request in group:
+                    request.future.cancel()
                 raise
+
+        # Independent RPC banks can be in flight together. The underlying
+        # transport still enforces its unchanged request pace and connection cap.
+        await asyncio.gather(*(read_group(group) for group in groups))
 
     async def close(self) -> None:
         self.pool_banks.clear()

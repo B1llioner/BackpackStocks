@@ -445,12 +445,16 @@ class WalletWatcher:
         context = {"reason": "no_contemporaneous_quote", "checked_at": self.clock()}
         if row:
             offset = row["dex_observed_at"] - record["block_time"]
+            wallet_quantity = abs(stocks[0]["raw"])
+            quote_quantity = row["quoted_output_raw"] if direction == REVERSE else row["delivered_raw"]
             context.update(
                 quote_time=row["dex_observed_at"],
                 offset_s=offset,
                 monitor_cost_raw=row["cost_raw"],
                 monitor_profit_raw=row["profit_raw"],
-                monitor_quantity_raw=row["delivered_raw"],
+                monitor_quantity_raw=quote_quantity,
+                wallet_quantity_raw=wallet_quantity,
+                stock_decimals=stocks[0]["decimals"],
             )
             if (
                 -self.monitor.settings.monitor.max_quote_age_s <= offset <= 0
@@ -459,7 +463,9 @@ class WalletWatcher:
                 and (row.get("backpack_valid_until") or row.get("backpack_rfq_valid_until") or 0)
                 > record["block_time"]
             ):
-                context["reason"] = "recent_monitor_quote"
+                context["reason"] = (
+                    "recent_monitor_quote" if quote_quantity == wallet_quantity else "quote_quantity_mismatch"
+                )
         # A wallet observation prioritizes a new calculation, never an automatic trade.
         context["refresh_requested"] = self.monitor.request_refresh(symbol)
         context.update(self.monitor.budget_info(symbol))
@@ -686,6 +692,14 @@ def activity_text(record: dict) -> str:
             lines.append("Нет котировки на момент сделки; новый расчёт поставлен в очередь.")
         else:
             lines.append("Нет котировки на момент сделки; новый расчёт пока недоступен.")
+    elif reason == "quote_quantity_mismatch":
+        comparison = record["correlation"]
+        scale = Decimal(10) ** comparison["stock_decimals"]
+        lines.append(
+            f"Ближайший расчёт был на {Decimal(comparison['monitor_quantity_raw']) / scale:f} шт; "
+            f"в кошельке {Decimal(comparison['wallet_quantity_raw']) / scale:f} шт. "
+            "Для этого объёма котировки нет."
+        )
     elif reason == "recent_monitor_quote":
         comparison = record["correlation"]
         lines.append(

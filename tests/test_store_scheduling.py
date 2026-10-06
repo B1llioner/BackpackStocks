@@ -10,13 +10,14 @@ def test_paper_queue_tuning_preserves_existing_journal(tmp_path):
     store.event(None, "prior_event", {"saved": True})
     store.set_meta("telegram:offset", "123")
     store.close()
-    settings.monitor.concurrency = 8
+    settings.monitor.concurrency = 16
     settings.monitor.exploration_s = 30
+    settings.monitor.quote_refresh_s = 5
     store = Store(settings.database, settings)
     try:
         assert store.db.execute("SELECT kind FROM events").fetchone()[0] == "prior_event"
         assert store.get_meta("telegram:offset") == "123"
-        assert Settings.model_validate_json(store.get_meta("settings")).monitor.concurrency == 8
+        assert Settings.model_validate_json(store.get_meta("settings")).monitor.concurrency == 16
     finally:
         store.close()
 

@@ -396,6 +396,33 @@ async def test_batch_chunking_does_not_split_a_pool_between_banks():
         await batch.close()
 
 
+async def test_batch_coalesces_interleaved_buckets_and_reads_independent_banks_concurrently():
+    admitted = []
+    both_started = asyncio.Event()
+
+    async def read(refs, **kwargs):
+        admitted.append((refs, kwargs))
+        if len(admitted) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), 1)
+        return {"context": {"slot": 200}, "value": refs}
+
+    batch = QuoteAccountBatch(SimpleNamespace(accounts=AsyncMock(side_effect=read)))
+    try:
+        results = await asyncio.gather(
+            batch.accounts(["A"], parsed=True, min_slot=120, priority=10),
+            batch.accounts(["B"], parsed=False, min_slot=100, priority=5),
+            batch.accounts(["C"], parsed=True, min_slot=130, priority=10),
+        )
+        assert [r["value"] for r in results] == [["A"], ["B"], ["C"]]
+        assert admitted == [
+            (["A", "C"], {"parsed": True, "min_slot": 130, "priority": 10}),
+            (["B"], {"parsed": False, "min_slot": 100, "priority": 5}),
+        ]
+    finally:
+        await batch.close()
+
+
 @pytest.mark.parametrize("failure", ["short_response", "old_slot", "exception"])
 async def test_account_batch_rejects_incomplete_old_or_failed_banks(failure):
     rpc = SimpleNamespace(accounts=AsyncMock(return_value={"context": {"slot": 1}, "value": [None]}))

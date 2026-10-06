@@ -91,6 +91,8 @@ REASONS = {
     "Frontend slippage exceeds monitor policy or is invalid": "slippage_limit",
 }
 MARKET_BLOCKS = {
+    "pool_bank_not_ready",
+    "stale_pool_quote",
     "slippage_limit",
     "pool_disabled",
     "pool_not_open",

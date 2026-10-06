@@ -423,7 +423,23 @@ def test_wallet_focus_has_a_bound_and_does_not_starve_overdue_stocks(monitor):
     mon.requested.clear()
     mon.attempted[("WEN.US", FORWARD)] = clock() - 300
     mon.attempted[("WEN.US", REVERSE)] = clock() - 300
+    assert mon.choose()[0] in mon.focus_until
     assert mon.choose()[0] == "WEN.US"
+
+
+def test_wallet_focus_does_not_wait_for_the_initial_universe_sweep(monitor):
+    mon, clock = monitor
+    mon.assets["WEN.US"] = replace(mon.assets["WEN.US"], deposit_enabled=False)
+    for index in range(68):
+        symbol = f"S{index:02d}.US"
+        mon.assets[symbol] = asset(symbol, USDC_MINT, deposit=False)
+        mon.chain[symbol] = "verified_unit_mapping"
+        mon.backpack.stock_feed.latest[symbol[:-3]] = observed(clock)
+    mon.request_refresh("WEN.US")
+    mon.requested.clear()
+    mon.attempted[("WEN.US", FORWARD)] = clock() - 10
+    assert mon.choose() == ("WEN.US", FORWARD)
+    assert mon.choose()[0] != "WEN.US"
 
 
 async def test_sell_availability_is_checked_before_reverse_dex_work(monitor):

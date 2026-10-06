@@ -52,6 +52,7 @@ class Store:
                 # Prices, amounts, fees, TTLs and every live setting stay pinned.
                 stored.monitor.concurrency = settings.monitor.concurrency
                 stored.monitor.exploration_s = settings.monitor.exploration_s
+                stored.monitor.quote_refresh_s = settings.monitor.quote_refresh_s
             if stored.model_dump_json() != encoded:
                 self.close()
                 raise RuntimeError("Config differs from the database; use a new database for changed policy")

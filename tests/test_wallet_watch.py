@@ -226,7 +226,7 @@ def test_correlation_rejects_quote_received_after_trade(journal):
         "backpack_rfq_valid_until": 1020,
         "cost_raw": 100_000_000,
         "profit_raw": 500_000,
-        "delivered_raw": 100_000_000,
+        "delivered_raw": 1_999_840_000,
         "quoted_output_raw": 101_000_000,
         "minimum_output_raw": 100_500_000,
         "search_budget_usdc": "100",
@@ -245,6 +245,13 @@ def test_correlation_rejects_quote_received_after_trade(journal):
     before["observed_at"] = 1004
     watcher.capture_quote(before)
     assert watcher.correlation(record)["reason"] == "recent_monitor_quote"
+    different_size = copy.deepcopy(before)
+    different_size["delivered_raw"] = 100_000_000
+    watcher.capture_quote(different_size)
+    context = watcher.correlation(record)
+    assert context["reason"] == "quote_quantity_mismatch"
+    assert context["monitor_quantity_raw"] == 100_000_000
+    assert context["wallet_quantity_raw"] == 1_999_840_000
 
 
 def test_wallet_registration_rejects_invalid_addresses(journal):
