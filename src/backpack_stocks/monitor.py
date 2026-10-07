@@ -134,6 +134,10 @@ class ForwardCoverage:
     renewal_retry_at: float = 0
     renewal_reason: str | None = None
     route_candidate: dict | None = None
+    prefetched_route: dict | None = None
+    prefetched_identity: tuple | None = None
+    discovery_retry_at: float = 0
+    discovery_failures: int = 0
     reason: str | None = None
     completed: bool = False
 
@@ -269,6 +273,7 @@ class SpreadMonitor:
         self.coverage_route_pending: dict[str, asyncio.Task] = {}
         self.coverage_pending: set[tuple[str, str]] = set()
         self.search_pending: set[tuple[str, str]] = set()
+        self.minimum_pending: dict[tuple[str, str], asyncio.Task] = {}
         self.coverage_turn = True
         self.quote_observer: Callable[[dict], None] | None = None
         config = settings.monitor
@@ -951,8 +956,11 @@ class SpreadMonitor:
         now = self.clock()
         for asset in self.assets.values():
             key = asset.symbol, FORWARD
-            if self.chain.get(asset.symbol) != "verified_unit_mapping" or (
-                key in self.pending and key != ignore_pending
+            if (
+                self.chain.get(asset.symbol) != "verified_unit_mapping"
+                or key in self.minimum_pending
+                or key in self.pending
+                and key != ignore_pending
             ):
                 continue
             try:
@@ -1003,19 +1011,143 @@ class SpreadMonitor:
             available.append((bool(state.attempted_at), state.attempted_at, asset.symbol))
         return available
 
+    def coverage_topology_identity(self, state: ForwardCoverage) -> tuple:
+        """Bind a topology hint to the current legal minimum without a purchase price."""
+        asset = state.asset
+        session, rules = self.coverage_rules(asset)
+        if (
+            self.assets.get(asset.symbol) != asset
+            or self.chain.get(asset.symbol) != "verified_unit_mapping"
+            or self.forward_coverage.get(asset.symbol) is not state
+            or session != state.session
+            or raw(self.minimum_quantity(asset, rules), asset.decimals) != state.quantity_raw
+            or self.settings.policy.withdrawal_semantics == "unverified"
+            or state.quantity_raw <= raw(asset.fee, asset.decimals)
+        ):
+            raise ValueError("Minimum topology identity changed")
+        return (
+            asset.symbol,
+            asset.mint,
+            asset.decimals,
+            asset.fee,
+            asset.withdrawal_min,
+            session,
+            state.quantity_raw,
+            self.settings.policy.withdrawal_semantics,
+            *(dec(rules[key]) for key in ("minQuantity", "maxQuantity", "stepSize")),
+        )
+
+    @staticmethod
+    def minimum_route_topology(route: dict) -> dict:
+        """Retain route addresses, input weights and original heads, never prices or proceeds."""
+        result = {
+            key: route[key] for key in ("inputMint", "outputMint", "inAmount", "contextSlot", "_observed_at")
+        }
+        legs = route.get("_direct_route")
+        if legs:
+            result["_direct_route"] = [SpreadMonitor.minimum_route_topology(leg) for leg in legs]
+        else:
+            result["pool"] = route["pool"]
+            direct = route.get("_direct", {})
+            result["_direct"] = {
+                key: list(direct[key]) if key == "arrays" else direct[key]
+                for key in ("program", "arrays")
+                if key in direct
+            }
+        return result
+
+    def valid_prefetched_route(self, state: ForwardCoverage) -> dict | None:
+        try:
+            if state.prefetched_route and state.prefetched_identity == self.coverage_topology_identity(state):
+                return state.prefetched_route
+        except (ValueError, KeyError, TypeError, ArithmeticError):
+            pass
+        return None
+
+    def prefetched_coverage_quote(
+        self, state: ForwardCoverage, *, fallback: Callable[..., Awaitable[dict]] | None = None
+    ) -> Callable[..., Awaitable[dict]] | None:
+        """Activate only a legal hint and a real current purchase quote in the cold lane."""
+        from .direct import DirectRaydium
+
+        provider = self.quote_provider
+        if (
+            not isinstance(provider, DirectRaydium)
+            or provider.bank_feed is None
+            or self.indicative_feed is None
+        ):
+            return None
+        template = self.valid_prefetched_route(state)
+        if template is None:
+            return None
+        try:
+            self.sync_indicative_coverage(state)
+            self.coverage_observation(state.asset)
+            identity = self.coverage_topology_identity(state)
+        except (ValueError, KeyError, TypeError, ArithmeticError):
+            return None
+
+        async def refresh(source, target, amount, *, priority=10):
+            if (
+                self.coverage_topology_identity(state) != identity
+                or source != state.asset.mint
+                or target != USDC_MINT
+                or amount != state.quantity_raw - raw(state.asset.fee, state.asset.decimals)
+            ):
+                raise ValueError("Minimum topology identity changed")
+            try:
+                route = await provider.refreshed_plan_quote(
+                    source, target, amount, plan=template, priority=priority
+                )
+            except (QuoteUnavailable, ValueError) as error:
+                codes = error.codes if isinstance(error, QuoteUnavailable) else [error_code(error)]
+                if not codes or not set(codes) <= {
+                    "pool_bank_not_ready",
+                    "stale_pool_quote",
+                    "pool_changed_during_refresh",
+                    "insufficient_tick_coverage",
+                    "insufficient_liquidity",
+                    "no_tick_liquidity",
+                    "no_direct_pool",
+                    "ValueError",
+                }:
+                    raise
+                if self.coverage_topology_identity(state) != identity:
+                    raise ValueError("Minimum topology identity changed") from error
+                route = await (fallback or partial(provider.quote_pair, _rpc=provider.bank_feed))(
+                    source, target, amount, priority=priority, minimum=True
+                )
+            if self.coverage_topology_identity(state) != identity:
+                raise ValueError("Minimum topology identity changed")
+            return route
+
+        return refresh
+
     async def discover_coverage_route(self, state: ForwardCoverage) -> None:
         """Explore one fixed minimum in the background; never publish its price."""
         from .direct import DirectRaydium
 
         provider, asset = self.quote_provider, state.asset
-        if not isinstance(provider, DirectRaydium) or provider.bank_feed is None or state.plan is None:
+        if not isinstance(provider, DirectRaydium) or provider.bank_feed is None:
             return
         try:
-            self.coverage_observation(asset)
+            prewarm = (
+                state.plan is None and self.indicative_feed is not None and self.settings.mode == "paper"
+            )
+            if state.plan is None and not prewarm:
+                return
+            identity = self.coverage_topology_identity(state)
+            if not prewarm:
+                self.coverage_observation(asset)
             quantity = state.quantity_raw
             delivered = quantity - raw(asset.fee, asset.decimals)
             route = await provider.quote_pair(
-                asset.mint, USDC_MINT, delivered, priority=10, _rpc=provider.bank_feed
+                asset.mint,
+                USDC_MINT,
+                delivered,
+                priority=10,
+                _rpc=provider.bank_feed,
+                **({"minimum": True} if self.indicative_feed is not None else {}),
             )
             session, rules = self.coverage_rules(asset)
             if (
@@ -1025,10 +1157,25 @@ class SpreadMonitor:
                 or state.session != session
                 or raw(self.minimum_quantity(asset, rules), asset.decimals) != quantity
                 or self.settings.policy.withdrawal_semantics == "unverified"
-                or state.plan is None
-                or state.plan["input_raw"] != delivered
-                or not 0 <= self.clock() - route["_observed_at"] <= self.settings.policy.quote_max_age_s
+                or self.coverage_topology_identity(state) != identity
+                or not prewarm
+                and (state.plan is None or state.plan["input_raw"] != delivered)
+                or not 0 <= self.clock() - route["_observed_at"] < self.settings.policy.quote_max_age_s
             ):
+                return
+            state.discovery_failures = 0
+            state.discovery_retry_at = 0
+            if prewarm:
+                if (
+                    route["inputMint"] != asset.mint
+                    or route["outputMint"] != USDC_MINT
+                    or int(route["inAmount"]) != delivered
+                ):
+                    raise ValueError("Minimum topology pair/quantity mismatch")
+                state.prefetched_route = self.minimum_route_topology(route)
+                state.prefetched_identity = identity
+                provider.bank_feed.changed.set()
+                event("coverage_route_prefetched", asset=asset.symbol, quantity_raw=quantity)
                 return
             # A local reprice may have replaced plan while discovery waited.
             # Adopt only the topology into the current owner, then recompute
@@ -1040,13 +1187,19 @@ class SpreadMonitor:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            state.discovery_failures += 1
+            state.discovery_retry_at = self.clock() + min(60, 5 * 2 ** min(state.discovery_failures, 4))
             event("coverage_route_discovery_unavailable", asset=asset.symbol, code=error_code(error))
 
     def adopt_coverage_routes(self) -> None:
         """Apply topology only between baseline tasks, so old math cannot overwrite it."""
         for symbol, state in self.forward_coverage.items():
             route = state.route_candidate
-            if route is None or (symbol, FORWARD) in self.pending:
+            if (
+                route is None
+                or (symbol, FORWARD) in self.pending
+                or (symbol, FORWARD) in getattr(self, "minimum_pending", {})
+            ):
                 continue
             state.route_candidate = None
             try:
@@ -1084,14 +1237,47 @@ class SpreadMonitor:
                 ):
                     now = self.clock()
                     due = []
+                    if self.indicative_feed is not None and self.settings.mode == "paper":
+                        for asset in self.assets.values():
+                            if self.chain.get(asset.symbol) != "verified_unit_mapping":
+                                continue
+                            try:
+                                self.coverage_state(asset)
+                            except (ValueError, KeyError, TypeError, ArithmeticError):
+                                continue
                     for state in self.forward_coverage.values():
                         if (
-                            state.plan is None
-                            or now - state.discovery_at < self.settings.monitor.exploration_s
+                            now - state.discovery_at < self.settings.monitor.exploration_s
+                            or now < state.discovery_retry_at
+                            or now < getattr(self.quote_provider, "discovery_provider_retry_at", 0)
                         ):
                             continue
                         try:
-                            self.coverage_observation(state.asset)
+                            self.coverage_topology_identity(state)
+                            if state.plan is None:
+                                latest = (
+                                    self.indicative_feed.latest.get(state.asset.ticker)
+                                    if self.indicative_feed
+                                    else None
+                                )
+                                if (
+                                    self.settings.mode != "paper"
+                                    or latest is None
+                                    or self.valid_prefetched_route(state) is not None
+                                    or not 0
+                                    <= now - latest.published_at
+                                    < self.settings.monitor.max_quote_age_s
+                                    or not latest.published_at <= latest.received_at <= now
+                                    or latest.reason
+                                    in {"indicative_invalid_payload", "indicative_invalid_reason"}
+                                    or latest.reason is None
+                                    and latest.ask is not None
+                                    or (state.asset.symbol, FORWARD) in self.pending
+                                    or (state.asset.symbol, FORWARD) in getattr(self, "minimum_pending", {})
+                                ):
+                                    continue
+                            else:
+                                self.coverage_observation(state.asset)
                         except (ValueError, KeyError, TypeError, ArithmeticError):
                             continue
                         due.append(state)
@@ -2120,7 +2306,6 @@ class SpreadMonitor:
     ) -> dict | None:
         symbol, direction = key
         started = self.clock()
-        previous_result = self.results.get(key) if coverage else None
         coverage_state = None
         if local_plan is None:
             if not coverage:
@@ -2303,10 +2488,20 @@ class SpreadMonitor:
                     )
             if self.assets.get(symbol) != asset:
                 return None
+            if coverage_state is not None:
+                session, rules = self.coverage_rules(asset)
+                if (
+                    self.forward_coverage.get(symbol) is not coverage_state
+                    or coverage_state.asset != asset
+                    or coverage_state.session != session
+                    or raw(self.minimum_quantity(asset, rules), asset.decimals) != coverage_state.quantity_raw
+                    or acquired != coverage_state.quantity_raw
+                ):
+                    return None
             edge = Decimal(profit) * 10000 / cost
             dex_impact = abs(impact_percent(quote))
             impact = max(dex_impact, dec(book_fill.impact_pct)) if book_fill else dex_impact
-            self.results[key] = {
+            result = {
                 "asset": symbol,
                 "direction": direction,
                 "mint": asset.mint,
@@ -2383,35 +2578,34 @@ class SpreadMonitor:
                 else None,
             }
             if book_fill:
-                self.results[key].update(self.book_fields(asset, book_fill))
+                result.update(self.book_fields(asset, book_fill))
             from .direct import DirectRaydium
 
             if isinstance(self.quote_provider, DirectRaydium):
-                self.results[key]["dex_bank_versions"] = self.quote_provider.bank_versions(quote)
+                result["dex_bank_versions"] = self.quote_provider.bank_versions(quote)
             if local_plan is not None:
-                self.results[key]["backpack_valid_until"] = min(
-                    self.results[key].get("backpack_valid_until")
-                    or self.results[key].get("backpack_rfq_valid_until")
-                    or 0,
-                    self.results[key]["dex_observed_at"] + p.quote_max_age_s,
+                result["backpack_valid_until"] = min(
+                    result.get("backpack_valid_until") or result.get("backpack_rfq_valid_until") or 0,
+                    result["dex_observed_at"] + p.quote_max_age_s,
                 )
             if not coverage:
-                self.volume_search.record(key, self.results[key])
-            if self.quote_observer and not coverage and self.results[key]["backpack_quote_confirmed"]:
-                self.quote_observer(self.results[key])
+                self.results[key] = result
+                self.volume_search.record(key, result)
+            if self.quote_observer and not coverage and result["backpack_quote_confirmed"]:
+                self.quote_observer(result)
             if not coverage:
                 self.failures.pop(key, None)
                 self.failure_causes.pop(key, None)
-            pair = price_pair(self.results[key])
+            pair = price_pair(result)
             if not coverage:
                 previous_price = self.price_history.get(key)
                 if previous_price and pair["updated_at"] > previous_price["updated_at"]:
                     self.price_repeat_intervals.append(pair["updated_at"] - previous_price["updated_at"])
                 self.price_history[key] = pair
             self.completed_quotes += 1
-            plan = {**self.results[key], "dex_plan": quote}
+            plan = {**result, "dex_plan": quote}
             if coverage_state:
-                coverage_state.result = dict(self.results[key])
+                coverage_state.result = dict(result)
                 coverage_state.plan = plan
                 coverage_state.reason = coverage_state.renewal_reason
                 coverage_state.retry_at = 0
@@ -2425,7 +2619,7 @@ class SpreadMonitor:
                 self.rfq_after.pop((symbol, "Bid" if direction == FORWARD else "Ask"), None)
             if isinstance(
                 self.quote_provider, DirectRaydium
-            ) and self.quote_provider.bank_versions_are_current(self.results[key]["dex_bank_versions"]):
+            ) and self.quote_provider.bank_versions_are_current(result["dex_bank_versions"]):
                 version = self.local_input_version(key, plan)
                 minimum_owner = (
                     direction == FORWARD
@@ -2454,8 +2648,8 @@ class SpreadMonitor:
                 edge_bps=str(edge),
                 impact_pct=str(impact),
                 backpack_price=pair["backpack_price"],
-                backpack_source=self.results[key]["backpack_source"],
-                backpack_market=self.results[key].get("backpack_market"),
+                backpack_source=result["backpack_source"],
+                backpack_market=result.get("backpack_market"),
                 dex_price=pair["dex_price"],
                 quoted_output_raw=quoted_output,
                 minimum_output_raw=output,
@@ -2463,7 +2657,9 @@ class SpreadMonitor:
                 elapsed_s=self.clock() - started,
                 phase="local" if local_plan is not None else "network",
             )
-            actual = self.results[key]
+            if coverage:
+                return result
+            actual = result
             now = self.clock()
             fresh_samples = [
                 r
@@ -2494,7 +2690,8 @@ class SpreadMonitor:
                 self.price_history[key] = price_pair(self.results[key])
             return actual
         except asyncio.CancelledError:
-            self.results.pop(key, None)
+            if not coverage:
+                self.results.pop(key, None)
             raise
         except Exception as error:
             if coverage_state:
@@ -2564,11 +2761,6 @@ class SpreadMonitor:
                 delay = min(60, self.settings.monitor.quote_refresh_s * 2 ** min(self.quote_failures[key], 3))
                 self.retry_after[key] = self.clock() + delay
         finally:
-            if coverage:
-                if previous_result is None:
-                    self.results.pop(key, None)
-                else:
-                    self.results[key] = previous_result
             self.updated.set()
         return None
 
@@ -2743,6 +2935,42 @@ class SpreadMonitor:
 
         for state in self.forward_coverage.values():
             plan = state.plan
+            if plan is None and self.indicative_feed is not None:
+                warmed = self.valid_prefetched_route(state)
+                if warmed is not None:
+                    try:
+                        self.sync_indicative_coverage(state)
+                        self.coverage_observation(state.asset)
+                        keys = {
+                            (pool, source, target, 10)
+                            for pool, source, target, _, _ in provider.bank_versions(warmed)
+                        }
+                        primary.update(keys)
+                        # No current calculation exists yet to resolve a head
+                        # expansion. Pin only the validated topology dependencies.
+                        unresolved.update(keys)
+                        for key, limit in owned_arrays(warmed).items():
+                            minimum_arrays[key] = max(minimum_arrays.get(key, 0), limit)
+                        promote = getattr(feed, "promote", None)
+                        if promote is not None and any(key not in getattr(feed, "hot", {}) for key in keys):
+                            promote(
+                                {
+                                    "routePlan": [
+                                        {
+                                            "swapInfo": {
+                                                "ammKey": pool,
+                                                "inputMint": source,
+                                                "outputMint": target,
+                                            }
+                                        }
+                                        for pool, source, target, _ in keys
+                                    ]
+                                },
+                                10,
+                            )
+                    except (ValueError, KeyError, TypeError, ArithmeticError):
+                        pass
+                continue
             if (
                 not plan
                 or not plan.get("minimum_coverage")
@@ -2763,12 +2991,24 @@ class SpreadMonitor:
                 self.coverage_observation(state.asset)
                 if plan["backpack_session"] != state.session:
                     continue
-                primary.update(
-                    {
-                        (pool, source, target, 10)
-                        for pool, source, target, _, _ in provider.bank_versions(plan["dex_plan"])
-                    }
-                )
+                keys = {
+                    (pool, source, target, 10)
+                    for pool, source, target, _, _ in provider.bank_versions(plan["dex_plan"])
+                }
+                primary.update(keys)
+                promote = getattr(feed, "promote", None)
+                if promote is not None and any(key not in getattr(feed, "hot", {}) for key in keys):
+                    # A provider refusal can outlast hot retention. Restoring
+                    # ownership must also let known addresses refresh again.
+                    promote(
+                        {
+                            "routePlan": [
+                                {"swapInfo": {"ammKey": pool, "inputMint": source, "outputMint": target}}
+                                for pool, source, target, _ in keys
+                            ]
+                        },
+                        10,
+                    )
                 for pool, source, target, slot, observed in provider.bank_versions(plan["dex_plan"]):
                     key = pool, source, target, 10
                     bank = feed.peek(key)
@@ -2808,10 +3048,16 @@ class SpreadMonitor:
                     self.local_pending.discard(key)
                     self.coverage_pending.discard(key)
                     self.search_pending.discard(key)
+            for key, task in list(self.minimum_pending.items()):
+                if task.done():
+                    if not task.cancelled():
+                        await task
+                    self.minimum_pending.pop(key)
             self.adopt_coverage_routes()
             self.sync_primary_banks()
             concurrency = self.settings.monitor.concurrency
             local_limit = max(1, concurrency // 2)
+            collision_limit = min(4, local_limit)
             extra_minimum_lane = (
                 self.settings.mode == "paper"
                 and self.forward_coverage_enabled
@@ -2819,6 +3065,23 @@ class SpreadMonitor:
                 and isinstance(provider, DirectRaydium)
                 and provider.bank_feed is not None
             )
+
+            def collision_candidate(key: tuple[str, str], plan: dict, *, enabled=extra_minimum_lane) -> bool:
+                owner = self.forward_coverage.get(key[0])
+                return bool(
+                    enabled
+                    and key in self.pending
+                    and key in self.search_pending
+                    and key not in self.coverage_pending
+                    and key[1] == FORWARD
+                    and plan.get("minimum_coverage")
+                    and plan.get("backpack_source") == "indicative"
+                    and owner is not None
+                    and owner.plan is plan
+                    and owner.asset == self.assets.get(key[0])
+                    and owner.quantity_raw == plan.get("acquired_raw")
+                )
+
             # Dispatching this batch has no await. WS, metadata and bank inputs
             # cannot change until we yield, so validate each owner/version once.
             coverage_candidates: list[tuple[bool, float, str]] | None = None
@@ -2827,8 +3090,8 @@ class SpreadMonitor:
             while not self.reporting and (
                 len(self.pending) < concurrency
                 or extra_minimum_lane
-                and len(self.local_pending) < local_limit
-                and len(self.pending) < concurrency + local_limit
+                and len(self.local_pending) + len(self.minimum_pending) < local_limit
+                and len(self.pending) + len(self.minimum_pending) < concurrency + local_limit
             ):
                 provider = self.quote_provider
                 from .direct import DirectRaydium
@@ -2839,7 +3102,12 @@ class SpreadMonitor:
                     if coverage_candidates is None:
                         coverage_candidates = self.forward_coverage_candidates()
                     candidate = min(
-                        (row for row in coverage_candidates if (row[2], FORWARD) not in self.pending),
+                        (
+                            row
+                            for row in coverage_candidates
+                            if (row[2], FORWARD) not in self.pending
+                            and (row[2], FORWARD) not in self.minimum_pending
+                        ),
                         default=None,
                     )
                     if candidate is not None:
@@ -2877,13 +3145,14 @@ class SpreadMonitor:
                     if (
                         isinstance(provider, DirectRaydium)
                         and provider.bank_feed is not None
-                        and len(self.local_pending) < local_limit
+                        and len(self.local_pending) + len(self.minimum_pending) < local_limit
                     ):
                         now = self.clock()
                         possible = [
                             key
                             for key, plan in plans.items()
-                            if key not in self.pending
+                            if key not in self.minimum_pending
+                            and (key not in self.pending or collision_candidate(key, plan))
                             and key[0] in self.assets
                             and now >= self.local_after.get(key, 0)
                             and plan["mint"] == self.assets[key[0]].mint
@@ -2895,8 +3164,17 @@ class SpreadMonitor:
                             if local_version is not None and local_version != self.local_inputs.get(key):
                                 ready_local_inputs.append((key, local_version))
                 local_keys = (
-                    [row for row in ready_local_inputs if row[0] not in self.pending]
-                    if len(self.local_pending) < local_limit
+                    [
+                        row
+                        for row in ready_local_inputs
+                        if row[0] not in self.minimum_pending
+                        and (
+                            row[0] not in self.pending
+                            or len(self.minimum_pending) < collision_limit
+                            and collision_candidate(row[0], plans[row[0]])
+                        )
+                    ]
+                    if len(self.local_pending) + len(self.minimum_pending) < local_limit
                     else []
                 )
                 ready_minimum = [row for row in local_keys if plans[row[0]].get("minimum_coverage")]
@@ -2926,7 +3204,10 @@ class SpreadMonitor:
                             and isinstance(provider, DirectRaydium)
                             and provider.bank_feed is not None
                         ):
-                            coverage_quote = partial(quote_pair or provider.quote_pair, minimum=True)
+                            prefetched = getattr(self, "prefetched_coverage_quote", None)
+                            coverage_quote = prefetched(state, fallback=quote_pair) if prefetched else None
+                            if coverage_quote is None:
+                                coverage_quote = partial(quote_pair or provider.quote_pair, minimum=True)
                     self.coverage_turn = False
                     self.coverage_pending.add(coverage_key)
                     self.pending[coverage_key] = asyncio.create_task(
@@ -2948,11 +3229,8 @@ class SpreadMonitor:
                     self.local_inputs[key] = local_version
                     plan = plans[key]
                     coverage = plan.get("minimum_coverage", False)
-                    self.local_pending.add(key)
-                    if coverage:
-                        self.coverage_pending.add(key)
                     self.local_turn = False
-                    self.pending[key] = asyncio.create_task(
+                    task = asyncio.create_task(
                         self.quote(
                             key,
                             notional=dec(plan["search_budget_usdc"]),
@@ -2961,6 +3239,16 @@ class SpreadMonitor:
                             coverage=coverage,
                         )
                     )
+                    if key in self.pending:
+                        # Only a ready owned public minimum may share the key
+                        # with a larger search. It owns no ordinary result row.
+                        assert collision_candidate(key, plan)
+                        self.minimum_pending[key] = task
+                    else:
+                        self.local_pending.add(key)
+                        if coverage:
+                            self.coverage_pending.add(key)
+                        self.pending[key] = task
                     continue
                 if selected is None:
                     break
@@ -3008,7 +3296,9 @@ class SpreadMonitor:
                 waiters.append(asyncio.create_task(bank_changed.wait()))
             try:
                 done, _ = await asyncio.wait(
-                    [*waiters, *self.pending.values()], return_when=asyncio.FIRST_COMPLETED, timeout=0.25
+                    [*waiters, *self.pending.values(), *self.minimum_pending.values()],
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=0.25,
                 )
                 for waiter in waiters:
                     if waiter in done:
@@ -3047,12 +3337,13 @@ class SpreadMonitor:
                 await asyncio.sleep(5)
 
     async def close(self) -> None:
-        tasks = [*self.tasks, *self.pending.values()]
+        tasks = [*self.tasks, *self.pending.values(), *self.minimum_pending.values()]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self.tasks.clear()
         self.pending.clear()
+        self.minimum_pending.clear()
         if self._owns_quote_provider and self._quote_provider is not None:
             await self._quote_provider.close()
 
@@ -3193,7 +3484,8 @@ class SpreadMonitor:
             "currentroute_missing": 0,
             "pending": sum(
                 key in self.pending and not self.pending[key].done() for key in self.coverage_pending
-            ),
+            )
+            + sum(not task.done() for task in self.minimum_pending.values()),
             "unverified": len(self.assets) - eligible,
             "first_pass_completed": completed,
             "known_blocks": known_blocks,
@@ -3690,7 +3982,7 @@ class SpreadMonitor:
             "rfq_confirmed_calculations": sum(pair.get("backpack_source") == "rfq" for pair in prices),
             "stock_value_backend": self.stock_values.backend,
             "quote_retry_waiting": sum(now < deadline for deadline in self.retry_after.values()),
-            "pending": len(self.pending),
+            "pending": len(self.pending) + len(self.minimum_pending),
             "reporting": self.reporting,
             "last_report": dict(self.last_report),
             "errors": dict(self.errors),

@@ -571,6 +571,103 @@ class DirectRaydium:
         feed.local_quotes += 1
         return result
 
+    async def refreshed_plan_quote(
+        self, source: str, target: str, amount: int, *, plan: dict, priority: int = 10
+    ) -> dict:
+        """Refresh known pool dependencies in the network lane; old prices are never reused."""
+        from .direct_routes import combine
+
+        feed = self.bank_feed
+        if type(amount) is not int or not 0 < amount < 2**63 or source == target:
+            raise ValueError("Invalid exact-in amount/pair")
+        if feed is None:
+            raise LocalQuoteNotReady()
+        seen: set[int] = set()
+        pools: set[str] = set()
+
+        def validate(node: dict, depth: int = 0) -> None:
+            if not isinstance(node, dict) or id(node) in seen or depth > 8 or len(seen) >= 64:
+                raise ValueError("Invalid bounded route topology")
+            seen.add(id(node))
+            if (
+                not isinstance(node.get("inputMint"), str)
+                or not isinstance(node.get("outputMint"), str)
+                or node["inputMint"] == node["outputMint"]
+                or not isinstance(node.get("inAmount"), str)
+                or not node["inAmount"].isdigit()
+                or not 0 < int(node["inAmount"]) < 2**63
+            ):
+                raise ValueError("Invalid route pair/amount")
+            legs = node.get("_direct_route")
+            if not legs:
+                pool = node.get("pool")
+                if not isinstance(pool, str) or not pool or pool in pools:
+                    raise ValueError("Invalid or repeated route pool")
+                pools.add(pool)
+                return
+            if not isinstance(legs, list) or not 1 <= len(legs) <= 8:
+                raise ValueError("Invalid bounded route legs")
+            for leg in legs:
+                validate(leg, depth + 1)
+            split = all(
+                (leg["inputMint"], leg["outputMint"]) == (node["inputMint"], node["outputMint"])
+                for leg in legs
+            )
+            if split:
+                if sum(int(leg["inAmount"]) for leg in legs) != int(node["inAmount"]):
+                    raise ValueError("Invalid split allocation")
+            elif (
+                legs[0]["inputMint"] != node["inputMint"]
+                or legs[-1]["outputMint"] != node["outputMint"]
+                or any(a["outputMint"] != b["inputMint"] for a, b in zip(legs, legs[1:], strict=False))
+            ):
+                raise ValueError("Invalid sequential route pair")
+
+        validate(plan)
+        if plan["inputMint"] != source or plan["outputMint"] != target:
+            raise ValueError("Known route pair mismatch")
+        started = time.time()
+
+        async def reprice(node: dict, units: int) -> dict:
+            if not 0 < units < 2**63:
+                raise ValueError("Invalid complete route credit")
+            legs = node.get("_direct_route")
+            if not legs:
+                return await self.pool_quote(
+                    node["pool"], node["inputMint"], node["outputMint"], units, priority=priority, _rpc=feed
+                )
+            split = all(
+                (leg["inputMint"], leg["outputMint"]) == (node["inputMint"], node["outputMint"])
+                for leg in legs
+            )
+            values: list[dict] = []
+            remaining = units
+            for index, leg in enumerate(legs):
+                if split:
+                    credit = (
+                        remaining
+                        if index == len(legs) - 1
+                        else units * int(leg["inAmount"]) // int(node["inAmount"])
+                    )
+                    remaining -= credit
+                else:
+                    credit = units if not values else int(values[-1]["outAmount"])
+                values.append(await reprice(leg, credit))
+            return combine(values, sequential=not split)
+
+        result = await reprice(plan, amount)
+        if (
+            result["inputMint"] != source
+            or result["outputMint"] != target
+            or int(result["inAmount"]) != amount
+            or not 0 <= time.time() - result["_observed_at"] < self.settings.policy.quote_max_age_s
+            or not self.bank_versions_are_current(self.bank_versions(result), priority)
+        ):
+            raise LocalQuoteNotReady()
+        result.update(direct_execution_supported=False, _request_started_at=started)
+        feed.promote(result, priority)
+        return result
+
     def request_minimum_expansion(self, bank_key: BankKey | None) -> bool:
         """Queue validated bank growth outside the pure local quote lane."""
         feed = self.bank_feed
