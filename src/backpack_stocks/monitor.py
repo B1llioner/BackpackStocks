@@ -4279,7 +4279,11 @@ class SpreadMonitor:
         prices = [r for r in snapshot.get("prices", []) if selected(r)]
         lines = format_spreads(prices)
         if not lines:
-            lines = ["Свежих полных котировок пока нет. Спред и net не оценены."]
+            lines = [
+                "Положительных свежих спредов после расходов и slippage нет."
+                if prices
+                else "Свежих полных котировок пока нет. Спред и net не оценены."
+            ]
             rejected = [
                 row
                 for row in snapshot.get("rows", [])
@@ -4304,7 +4308,8 @@ class SpreadMonitor:
                         if code != "nonpositive_net"
                     }
                 )
-                lines.append(f"{symbol}: {block_text(reasons) or 'свежей котировки пока нет'}")
+                empty_reason = "нет положительного net" if prices else "свежей котировки пока нет"
+                lines.append(f"{symbol}: {block_text(reasons) or empty_reason}")
                 retry = max(
                     (d.get("retry_in_s", 0) for d in snapshot.get("diagnostics", []) if d["asset"] == symbol),
                     default=0,

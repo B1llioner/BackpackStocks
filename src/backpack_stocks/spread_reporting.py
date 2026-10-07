@@ -23,8 +23,10 @@ def dex_price(pair: dict) -> Decimal:
             if delivered > 0:
                 return Decimal(pair["quoted_output_raw"]) / 1_000_000 / delivered
         else:
-            return Decimal(pair["cost_raw"]) / 1_000_000 / (
-                Decimal(pair["quoted_output_raw"]) / 10 ** pair["stock_decimals"]
+            return (
+                Decimal(pair["cost_raw"])
+                / 1_000_000
+                / (Decimal(pair["quoted_output_raw"]) / 10 ** pair["stock_decimals"])
             )
     return Decimal(pair["dex_price"])
 
@@ -49,6 +51,7 @@ def best_spreads(prices: list[dict], *, limit: int = 5) -> list[dict]:
                 or type(pair["cost_raw"]) is not int
                 or pair["cost_raw"] <= 0
                 or type(pair["profit_raw"]) is not int
+                or pair["profit_raw"] <= 0
                 or not isinstance(pair["asset"], str)
                 or not pair["asset"]
                 or not isfinite(pair["updated_at"])
@@ -63,7 +66,8 @@ def best_spreads(prices: list[dict], *, limit: int = 5) -> list[dict]:
             key = pair["asset"], pair["direction"]
             previous = best.get(key)
             if previous is None or rank > (
-                Fraction(previous["profit_raw"], previous["cost_raw"]), previous["updated_at"]
+                Fraction(previous["profit_raw"], previous["cost_raw"]),
+                previous["updated_at"],
             ):
                 best[key] = pair
         except (KeyError, TypeError, ValueError, ArithmeticError, OSError):
@@ -82,7 +86,7 @@ def format_spreads(prices: list[dict]) -> list[str]:
     pairs = best_spreads(prices)
     if not pairs:
         return []
-    lines = ["Свежие спреды · net после расходов и slippage"]
+    lines = ["Положительные спреды · net после расходов и slippage"]
     for pair in pairs:
         forward = pair["direction"] == FORWARD
         dex_label = "Raydium" if pair.get("quote_backend") == "raydium" else "Jup"
@@ -131,6 +135,4 @@ def compact_coverage(snapshot: dict) -> list[str]:
         return [prefix + "; причины ожидания: /monitor."]
     if not (0 <= refused <= checked <= eligible and 0 <= waitingbank <= checked - refused - fresh):
         return ["BP → DEX: сведения о покрытии пока недоступны."]
-    return [
-        prefix + f"; BP без свежей цены {eligible - checked + refused}; ждут DEX {waitingbank}."
-    ]
+    return [prefix + f"; BP без свежей цены {eligible - checked + refused}; ждут DEX {waitingbank}."]

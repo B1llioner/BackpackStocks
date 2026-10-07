@@ -18,7 +18,7 @@ bot = test_telegram.bot
 engine = test_telegram.engine
 
 
-async def test_negative_spread_keeps_fresh_price_count_and_shows_actual_percentages():
+async def test_negative_spread_keeps_fresh_price_count_without_entering_positive_report():
     mon, clock = monitored()
     mon.jupiter.quote_pair.return_value = {"outAmount": "90000000", "priceImpact": "0.1"}
     await mon.quote(("WEN.US", FORWARD))
@@ -29,10 +29,10 @@ async def test_negative_spread_keeps_fresh_price_count_and_shows_actual_percenta
     assert snapshot["prices"][0]["quote_age_s"] == 3
     assert snapshot["prices"][0]["backpack_price"] == "6.2"
     assert snapshot["prices"][0]["profit_raw"] < 0
-    assert "Спред цены: -9.55%; net: -10.48% (-10.48 USDC)" in mon.text()
-    assert "BP 6.2 / Jup" in mon.text()
+    assert "Положительных свежих спредов после расходов и slippage нет" in mon.text()
+    assert "Спред цены:" not in mon.text() and "net:" not in mon.text()
     assert "УБЫТОК" in mon.prices_text(["WEN.US"])
-    assert "Объём: 99.999986 USDC" in mon.text() and "Pool spot" not in mon.text()
+    assert "Объём: 99.999986 USDC" in mon.prices_text(["WEN.US"])
 
 
 async def test_queued_digest_rerender_removes_expired_percentages(bot):
@@ -139,7 +139,7 @@ async def test_positive_quote_before_slippage_is_not_presented_as_a_profitable_c
     text = mon.prices_text(["WEN.US"])
     assert "УБЫТОК -0.33 USDC" in text and "По quote: +0.17 USDC" in text
     assert "ПРИБЫЛЬ В РАСЧЁТЕ" not in text
-    assert "Спред цены: +0.70%; net: -0.33% (-0.33 USDC)" in mon.text()
+    assert "Спред цены:" not in mon.text() and "net:" not in mon.text()
     assert "ПРИБЫЛЬ В РАСЧЁТЕ" not in mon.text()
 
 
@@ -185,7 +185,9 @@ async def test_spread_call_contains_actual_investment_and_directional_exchange_l
     assert "WEN.US" in text and "Чистый спред: +" in text
     assert "Объём: 100 USDC" in text if direction == REVERSE else "Объём: 99.999986 USDC" in text
     assert "Backpack: https://backpack.exchange/stocks/WEN" in text
-    jupiter = next(line.removeprefix("Jupiter: ") for line in text.splitlines() if line.startswith("Jupiter:"))
+    jupiter = next(
+        line.removeprefix("Jupiter: ") for line in text.splitlines() if line.startswith("Jupiter:")
+    )
     query = parse_qs(urlparse(jupiter).query)
     assert query == {
         "sell": [STOCK_MINT if direction == FORWARD else USDC_MINT],

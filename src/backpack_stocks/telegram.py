@@ -22,6 +22,7 @@ from .models import Phase, ui
 from .observability import event
 from .proxy import ProxyLogRedactor, checked_proxy, resolve_proxy
 from .runtime import required_env
+from .spread_reporting import best_spreads
 from .transport import retry_after_seconds
 
 COMMANDS = [
@@ -31,7 +32,7 @@ COMMANDS = [
         ("help", "Описание команд"),
         ("status", "Режим, активный цикл и лимиты"),
         ("spread", "Текущий расчёт спреда и расходов"),
-        ("spreads", "Топ свежих спредов всех доступных акций"),
+        ("spreads", "Свежие плюсовые спреды доступных акций"),
         ("prices", "Цены Backpack/Jupiter на 1000 USDC и статус RFQ"),
         ("optimize", "Подбор объёма по реальным котировкам: /optimize PUSA"),
         ("wallet", "История отслеживаемого кошелька: /wallet PUSA"),
@@ -51,7 +52,7 @@ COMMANDS = [
 HELP = (
     "/status — режим, состояние и лимиты\n"
     "/spread — текущий расчёт WEN; /spread FLWS — оба направления выбранной акции\n"
-    "/spreads — топ свежих спредов всех акций\n"
+    "/spreads — свежие плюсовые спреды после расходов\n"
     "/prices — цены всех акций, время обновления и RFQ; /prices WEN — одна акция\n"
     "/optimize PUSA — проверить размеры и повторно запросить лучший\n"
     "/wallet PUSA — история сделок; /watch <адрес> — отслеживать кошелёк\n"
@@ -360,7 +361,7 @@ class TelegramController:
         event("telegram_delivered", component="telegram", state=kind)
 
     async def send_reply(self, text: str, kind: str, render: Callable[[], str | None] | None) -> bool:
-        if kind == "alert" and render is not None:
+        if kind in {"alert", "digest"} and render is not None:
             current = await self.api.reply(self.allowed_user_id, text, render=render)
             if current is None:
                 event(
@@ -679,6 +680,16 @@ class TelegramController:
         ):
             text += f"\n{symbol}: обновление в приоритетной очереди."
         return text
+
+    def cached_positive_spread_text(self) -> str | None:
+        """Rerender only current positive numerical spreads, without network work."""
+        monitor = self.engine.monitor
+        if monitor is None:
+            return None
+        report = monitor.report()
+        if not best_spreads(report.get("prices", [])):
+            return None
+        return monitor.text(snapshot=report)
 
     async def deliver_report(self, symbol: str, *, started: float, pending: set) -> None:
         """One optional follow-up for a selected stock, with a bounded wait."""
@@ -1174,6 +1185,7 @@ async def report_worker(bot: TelegramController) -> None:
                 )
         if digest_due:
             previous, last_digest = marker, now
+            text = None
             if monitor:
                 try:
                     assert snapshot is not None
@@ -1186,18 +1198,17 @@ async def report_worker(bot: TelegramController) -> None:
                         key: report[key]
                         for key in ("observed_at", "report_source", "report_duration_s", "fresh_calculations")
                     }
-                    text = monitor.text(snapshot=report)
+                    if best_spreads(report.get("prices", [])):
+                        text = monitor.text(snapshot=report)
                 except Exception as error:
                     event("monitor_report_error", level="ERROR", code=type(error).__name__)
-                    text = "Не удалось прочитать текущий расчёт. /spreads — повторить запрос."
-            else:
-                text = "Монитор прогревается."
-            await bot.reply(
-                text,
-                priority=10,
-                kind="digest",
-                render=bot.cached_spread_text,
-            )
+            if text is not None:
+                await bot.reply(
+                    text,
+                    priority=10,
+                    kind="digest",
+                    render=bot.cached_positive_spread_text,
+                )
         if monitor:
             try:
                 assert last_rendered is not None

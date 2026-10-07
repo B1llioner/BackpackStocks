@@ -27,11 +27,16 @@ def pair(symbol="WEN.US", **changes):
     return row
 
 
-def test_digest_shows_negative_price_and_net_spread_with_actual_cost_and_both_prices():
-    text = "\n".join(format_spreads([pair()]))
+@pytest.mark.parametrize("profit", [-raw("2"), 0])
+def test_digest_omits_negative_and_zero_net_even_with_a_positive_price_spread(profit):
+    assert format_spreads([pair(profit_raw=profit, quoted_output_raw=raw("102"))]) == []
+
+
+def test_digest_shows_positive_net_with_actual_cost_and_both_prices():
+    text = "\n".join(format_spreads([pair(profit_raw=raw("2"), quoted_output_raw=raw("103"))]))
     assert "WEN.US · BP → Raydium · 05:46:40 МСК" in text
-    assert "Спред цены: -1.00%; net: -2.00% (-2.00 USDC)" in text
-    assert "Объём: 100 USDC · BP 10 / Raydium 9.9 USDC/шт" in text
+    assert "Спред цены: +3.00%; net: +2.00% (+2.00 USDC)" in text
+    assert "Объём: 100 USDC · BP 10 / Raydium 10.3 USDC/шт" in text
     assert "RFQ на выбранный объём" not in text
 
 
@@ -41,11 +46,13 @@ def test_best_volume_is_selected_by_exact_net_ratio_and_distinct_asset_direction
     reverse = pair(direction=REVERSE, profit_raw=raw("3"))
     prices = [high_absolute, high_percentage, reverse]
     prices.extend(pair(f"S{i:02d}.US", profit_raw=-raw(str(i))) for i in range(72))
+    prices.extend(pair(f"P{i:02d}.US", profit_raw=raw(Decimal(i) / 10)) for i in range(1, 8))
     best = best_spreads(prices)
     assert len(best) == 5
     assert best[0] is reverse and best[1] is high_percentage
     assert high_absolute not in best
     assert len({(row["asset"], row["direction"]) for row in best}) == 5
+    assert all(row["profit_raw"] > 0 for row in best)
     assert len(best_spreads(prices, limit=20)) == 5
 
 
@@ -65,9 +72,11 @@ def test_positive_public_price_requires_own_rfq_but_actual_book_fill_does_not(so
 
 
 def test_reverse_price_spread_uses_buy_venue_denominator_and_retains_transfer_price_risk():
-    text = "\n".join(format_spreads([pair(direction=REVERSE, quoted_output_raw=raw("9"))]))
+    text = "\n".join(
+        format_spreads([pair(direction=REVERSE, quoted_output_raw=raw("11"), profit_raw=raw("2"))])
+    )
     assert "Raydium → BP" in text
-    assert "Спред цены: -10.00%; net: -2.00% (-2.00 USDC)" in text
+    assert "Спред цены: +10.00%; net: +2.00% (+2.00 USDC)" in text
     assert "Продажа на BP после зачисления; цена за время перевода может измениться." in text
 
 
@@ -77,6 +86,8 @@ def test_price_spread_uses_raw_dex_math_even_when_six_decimal_price_hides_the_di
         dex_price="0.000050",
         quoted_output_raw=10001,
         sell_quantity="200",
+        cost_raw=10000,
+        profit_raw=1,
     )
     text = "\n".join(format_spreads([row]))
     assert "Спред цены: +0.01%" in text
@@ -97,7 +108,7 @@ def test_price_spread_uses_raw_dex_math_even_when_six_decimal_price_hides_the_di
     ],
 )
 def test_unusable_or_estimated_inputs_cannot_enter_a_fresh_digest(changes):
-    assert format_spreads([pair(**changes)]) == []
+    assert format_spreads([pair(**{"profit_raw": raw("2"), **changes})]) == []
 
 
 def test_empty_prices_do_not_pull_an_old_value_or_a_positive_call_from_history():
@@ -113,10 +124,21 @@ def test_empty_prices_do_not_pull_an_old_value_or_a_positive_call_from_history()
     assert "Спред цены:" not in text and "net:" not in text and "WEN.US" not in text
 
 
+def test_selected_negative_pair_is_not_mislabelled_as_a_missing_fresh_quote():
+    mon, _ = monitored()
+    text = mon.text("WEN.US", snapshot={"prices": [pair()]})
+    assert "нет положительного net" in text
+    assert "свежей котировки пока нет" not in text
+    assert "Спред цены:" not in text and "net:" not in text
+
+
 def test_digest_puts_values_before_compact_coverage_and_limits_seventy_two_tickers():
     mon, _ = monitored()
     snapshot = {
-        "prices": [pair(f"S{i:02d}.US", profit_raw=-raw(Decimal(i) / 100)) for i in range(72)],
+        "prices": [
+            pair(f"S{i:02d}.US", profit_raw=raw(Decimal(72 - i) / 100), quoted_output_raw=raw("102"))
+            for i in range(72)
+        ],
         "forward_coverage": {
             "enabled": True,
             "universe": 73,
@@ -141,7 +163,7 @@ def test_digest_puts_values_before_compact_coverage_and_limits_seventy_two_ticke
 def test_symbol_and_report_keys_filter_fresh_spreads_without_reintroducing_coverage():
     mon, _ = monitored()
     snapshot = {
-        "prices": [pair(), pair(direction=REVERSE), pair("AMD.US")],
+        "prices": [pair(), pair(direction=REVERSE, profit_raw=raw("2")), pair("AMD.US")],
         "report_keys": [("WEN.US", REVERSE)],
     }
     text = mon.text("WEN.US", snapshot=snapshot)

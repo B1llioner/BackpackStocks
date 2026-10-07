@@ -45,6 +45,7 @@ def reports(tmp_path, *, alerts=False):
             "observed_at": time.time(),
             "fresh_calculations": 0,
             "rows": list(monitor.results.values()),
+            "prices": [],
             "completed_quotes": 0,
             "fresh_quotes": 0,
             "candidates": 0,
@@ -69,7 +70,7 @@ def reports(tmp_path, *, alerts=False):
         clock=lambda: 10000,
         announce_candidates=AsyncMock(),
         reply=AsyncMock(),
-        cached_spread_text=lambda: "current prices",
+        cached_positive_spread_text=lambda: None,
     )
     return instance, monitor
 
@@ -113,7 +114,7 @@ async def test_dirty_bursts_coalesce_and_monotonic_deadline_rechecks_without_upd
         assert monitor.snapshot.call_count == 1
         monitor.report.assert_not_called()
         assert monitor.last_report["report_source"] == "background_cache"
-        assert controller.reply.await_count == 1
+        assert controller.reply.await_count == 0
         # A wall-clock rewind does not postpone or multiply the one-second
         # recalculation; no new event is needed to age out existing prices.
         wall[0] = 9990
