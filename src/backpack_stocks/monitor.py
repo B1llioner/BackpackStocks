@@ -1262,20 +1262,31 @@ class SpreadMonitor:
                                 )
                                 if (
                                     self.settings.mode != "paper"
-                                    or latest is None
+                                    or self.indicative_feed is None
                                     or self.valid_prefetched_route(state) is not None
-                                    or not 0
-                                    <= now - latest.published_at
-                                    < self.settings.monitor.max_quote_age_s
-                                    or not latest.published_at <= latest.received_at <= now
-                                    or latest.reason
-                                    in {"indicative_invalid_payload", "indicative_invalid_reason"}
-                                    or latest.reason is None
-                                    and latest.ask is not None
                                     or (state.asset.symbol, FORWARD) in self.pending
                                     or (state.asset.symbol, FORWARD) in getattr(self, "minimum_pending", {})
                                 ):
                                     continue
+                                if latest is not None and (
+                                    latest.reason
+                                    in {"indicative_invalid_payload", "indicative_invalid_reason"}
+                                    or not 0 < latest.published_at <= latest.received_at <= now
+                                ):
+                                    continue
+                                # A topology-only read needs current legal
+                                # metadata, not a purchase price. An absent or
+                                # expired source cannot block warming known
+                                # route inputs; no old price becomes usable.
+                                try:
+                                    current = self.indicative_check(
+                                        state.asset, state.quantity_raw, state.session
+                                    )
+                                except (ValueError, KeyError, TypeError, ArithmeticError):
+                                    pass
+                                else:
+                                    if current.usable(self.clock()):
+                                        continue
                             else:
                                 self.coverage_observation(state.asset)
                         except (ValueError, KeyError, TypeError, ArithmeticError):
@@ -2375,6 +2386,11 @@ class SpreadMonitor:
                         check = await self.rfq.check(symbol, previous.quantity, previous.session, side="Ask")
                         if not check.usable(self.clock()):
                             raise RfqUnavailable(check.reason)
+            if coverage_state is not None and local_plan is None and coverage_state.plan is None:
+                # Only a valid exact purchase followed by a real cold DEX
+                # request starts its discovery deadline. A source refusal
+                # must not postpone metadata-only route preparation.
+                coverage_state.discovery_at = self.clock()
             quote = await (quote_pair or self.quote_provider.quote_pair)(
                 source, target, input_raw, priority=10
             )
@@ -3197,7 +3213,6 @@ class SpreadMonitor:
                     if isinstance(provider, DirectRaydium) and state.plan:
                         coverage_quote = partial(provider.cached_plan_quote, plan=state.plan["dex_plan"])
                     else:
-                        state.discovery_at = self.clock()
                         if (
                             self.settings.mode == "paper"
                             and self.indicative_feed is not None
