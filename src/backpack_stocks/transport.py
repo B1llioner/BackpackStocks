@@ -101,8 +101,8 @@ class Transport:
             "responses_429_all_buckets": self.responses_429,
             "queued_by_priority": dict(
                 Counter(
-                    str(priority)
-                    for priority, _, request in self.requests.queue
+                    str(request.current_priority())
+                    for _, _, request in self.requests.queue
                     if not request.future.cancelled()
                 )
             ),
@@ -151,6 +151,7 @@ class Transport:
         mutation: bool | None = None,
         before_attempt: Callable[[], Awaitable[None]] | None = None,
         priority: int = 0,
+        priority_resolver: Callable[[], int] | None = None,
         category: str | None = None,
         limiter: PriorityLimiter | None = None,
         bucket: str = "main",
@@ -160,7 +161,9 @@ class Transport:
         for attempt in range(1 if writes else 3):
             try:
                 await self.bandwidth_slot()
-                start = await self.requests.acquire(admission, priority, category)
+                start = await self.requests.acquire(
+                    admission, priority, category, priority_resolver=priority_resolver
+                )
                 try:
                     await self.bandwidth_slot()
                     if before_attempt is not None:

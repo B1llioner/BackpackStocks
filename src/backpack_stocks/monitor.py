@@ -1147,7 +1147,7 @@ class SpreadMonitor:
                 delivered,
                 priority=10,
                 _rpc=provider.bank_feed,
-                **({"minimum": True} if self.indicative_feed is not None else {}),
+                **({"minimum": True} if prewarm else {}),
             )
             session, rules = self.coverage_rules(asset)
             if (

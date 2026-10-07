@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import struct
+from collections.abc import Callable
+from typing import Any
 
 from solders.pubkey import Pubkey
 
@@ -74,6 +76,8 @@ def assert_stock_mint(account: dict) -> dict:
 
 
 class SolanaRPC:
+    dynamic_account_priority = True
+
     def __init__(
         self,
         url: str,
@@ -96,14 +100,26 @@ class SolanaRPC:
     async def close(self) -> None:
         await self.http.close()
 
-    async def call(self, method: str, params: list, *, mutation: bool = False, priority: int = 0):
+    async def call(
+        self,
+        method: str,
+        params: list,
+        *,
+        mutation: bool = False,
+        priority: int = 0,
+        priority_resolver: Callable[[], int] | None = None,
+    ):
         self.sequence += 1
+        dynamic_options: dict[str, Any] = (
+            {"priority_resolver": priority_resolver} if priority_resolver is not None else {}
+        )
         result = await self.http.request(
             "POST",
             "",
             body={"jsonrpc": "2.0", "id": self.sequence, "method": method, "params": params},
             mutation=mutation,
             priority=priority,
+            **dynamic_options,
         )
         if "error" in result:
             # sendTransaction's explicit RPC rejection is not silently retried either.
@@ -117,6 +133,7 @@ class SolanaRPC:
         parsed: bool = False,
         min_slot: int | None = None,
         priority: int = 0,
+        priority_resolver: Callable[[], int] | None = None,
         commitment: str = "finalized",
     ) -> dict:
         if commitment not in {"finalized", "confirmed"}:
@@ -124,7 +141,9 @@ class SolanaRPC:
         config: dict = {"encoding": "jsonParsed" if parsed else "base64", "commitment": commitment}
         if min_slot is not None:
             config["minContextSlot"] = min_slot
-        return await self.call("getMultipleAccounts", [addresses, config], priority=priority)
+        return await self.call(
+            "getMultipleAccounts", [addresses, config], priority=priority, priority_resolver=priority_resolver
+        )
 
     async def check_mint(self, mint: str = STOCK_MINT) -> dict:
         result = await self.accounts([mint], parsed=True)

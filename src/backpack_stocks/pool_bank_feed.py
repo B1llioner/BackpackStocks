@@ -9,12 +9,14 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
 
+from .limiter import resolved_priority
 from .observability import error_code, event
 from .quote_batch import QuoteAccountBatch
 
 BankKey = tuple[str, str, str, int]
 REFRESHING: ContextVar[bool] = ContextVar("refreshing_pool_bank", default=False)
 REFRESH_PRIORITY: ContextVar[int] = ContextVar("pool_bank_refresh_priority", default=5)
+REFRESH_BANK: ContextVar[tuple[object, BankKey] | None] = ContextVar("pool_bank_refresh_key", default=None)
 
 
 class PoolBankFeed(QuoteAccountBatch):
@@ -145,9 +147,11 @@ class PoolBankFeed(QuoteAccountBatch):
                 return await producer()
             token = REFRESHING.set(True)
             priority_token = REFRESH_PRIORITY.set(self.refresh_priority(key))
+            bank_token = REFRESH_BANK.set((self, key))
             try:
                 return await producer()
             finally:
+                REFRESH_BANK.reset(bank_token)
                 REFRESH_PRIORITY.reset(priority_token)
                 REFRESHING.reset(token)
 
@@ -164,12 +168,29 @@ class PoolBankFeed(QuoteAccountBatch):
         self.remember(key, bank)
         return self.ready.get(key, bank)
 
-    async def accounts(self, addresses, *, parsed=False, min_slot=None, priority=0):
+    async def accounts(self, addresses, *, parsed=False, min_slot=None, priority=0, priority_resolver=None):
         # Current minimum routes precede other retained plans. Execution reads
         # at priority zero remain first. Cache keys keep their original priority.
         if REFRESHING.get():
+            original_priority = priority
+            original_resolver = priority_resolver
+            bank = REFRESH_BANK.get()
+            if bank is not None and bank[0] is self:
+                key = bank[1]
+
+                def current_priority():
+                    caller = resolved_priority(original_priority, original_resolver)
+                    return min(caller, self.refresh_priority(key))
+
+                priority_resolver = current_priority
             priority = min(priority, REFRESH_PRIORITY.get())
-        return await super().accounts(addresses, parsed=parsed, min_slot=min_slot, priority=priority)
+        return await super().accounts(
+            addresses,
+            parsed=parsed,
+            min_slot=min_slot,
+            priority=priority,
+            priority_resolver=priority_resolver,
+        )
 
     def set_primary(self, keys: Iterable[BankKey] | Mapping[BankKey, int]) -> None:
         """Classify known route banks without changing their age or retention."""
@@ -230,6 +251,7 @@ class PoolBankFeed(QuoteAccountBatch):
             # older read to finish. Other callers join us rather than duplicate it.
             token = REFRESHING.set(True)
             priority_token = REFRESH_PRIORITY.set(self.refresh_priority(key))
+            bank_token = REFRESH_BANK.set((self, key))
             previous = self.ready.get(key)
             owned_bank = None
             try:
@@ -280,6 +302,7 @@ class PoolBankFeed(QuoteAccountBatch):
                 event("pool_bank_refresh_blocked", pool=key[0], code=error_code(error))
                 raise
             finally:
+                REFRESH_BANK.reset(bank_token)
                 REFRESH_PRIORITY.reset(priority_token)
                 REFRESHING.reset(token)
 
@@ -354,6 +377,7 @@ class PoolBankFeed(QuoteAccountBatch):
                 async def refresh(key=key, priority=priority):
                     token = REFRESHING.set(True)
                     priority_token = REFRESH_PRIORITY.set(priority)
+                    bank_token = REFRESH_BANK.set((self, key))
                     previous = self.ready.get(key)
                     try:
                         async with self.limit:
@@ -371,6 +395,7 @@ class PoolBankFeed(QuoteAccountBatch):
                         event("pool_bank_refresh_blocked", pool=key[0], code=error_code(error))
                         raise
                     finally:
+                        REFRESH_BANK.reset(bank_token)
                         REFRESH_PRIORITY.reset(priority_token)
                         REFRESHING.reset(token)
 

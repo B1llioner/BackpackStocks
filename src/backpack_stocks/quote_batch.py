@@ -6,7 +6,9 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
+from .limiter import resolved_priority
 from .solana import SolanaRPC
 
 
@@ -17,10 +19,16 @@ class AccountRequest:
     min_slot: int | None
     priority: int
     future: asyncio.Future
+    priority_resolver: Callable[[], int] | None = None
+
+    def current_priority(self) -> int:
+        return resolved_priority(self.priority, self.priority_resolver)
 
 
 class QuoteAccountBatch:
     """Each pool's entire account group stays in one RPC bank, at most 100 addresses."""
+
+    dynamic_account_priority = True
 
     def __init__(self, rpc: SolanaRPC | QuoteAccountBatch, *, commitment: str | None = None):
         self.rpc = rpc
@@ -52,12 +60,20 @@ class QuoteAccountBatch:
         return await asyncio.shield(task)
 
     async def accounts(
-        self, addresses: list[str], *, parsed: bool = False, min_slot: int | None = None, priority: int = 0
+        self,
+        addresses: list[str],
+        *,
+        parsed: bool = False,
+        min_slot: int | None = None,
+        priority: int = 0,
+        priority_resolver: Callable[[], int] | None = None,
     ) -> dict:
         if not 0 < len(addresses) <= 100:
             raise ValueError("Invalid pool account group size")
         future = asyncio.get_running_loop().create_future()
-        self.waiting.append(AccountRequest(list(addresses), parsed, min_slot, priority, future))
+        self.waiting.append(
+            AccountRequest(list(addresses), parsed, min_slot, priority, future, priority_resolver)
+        )
         if not self.scheduled:
             self.scheduled = True
             task = asyncio.create_task(self.flush())
@@ -92,13 +108,21 @@ class QuoteAccountBatch:
         async def read_group(group: list[AccountRequest]) -> None:
             addresses = list(dict.fromkeys(a for r in group for a in r.addresses))
             slots = [r.min_slot for r in group if r.min_slot is not None]
+            dynamic = any(r.priority_resolver is not None for r in group)
+
+            def group_priority() -> int:
+                return min(r.current_priority() for r in group)
+
+            options: dict[str, Any] = {"commitment": self.commitment} if self.commitment is not None else {}
+            if dynamic and getattr(self.rpc, "dynamic_account_priority", False) is True:
+                options["priority_resolver"] = group_priority
             try:
                 response = await self.rpc.accounts(
                     addresses,
                     parsed=group[0].parsed,
                     min_slot=max(slots) if slots else None,
                     priority=group[0].priority,
-                    **({"commitment": self.commitment} if self.commitment is not None else {}),
+                    **options,
                 )
                 accounts = dict(zip(addresses, response["value"], strict=True))
                 if slots and response["context"]["slot"] < max(slots):

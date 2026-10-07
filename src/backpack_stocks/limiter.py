@@ -4,6 +4,19 @@ import asyncio
 import heapq
 import itertools
 import time
+from collections.abc import Callable
+
+
+def resolved_priority(priority: int, resolver: Callable[[], int] | None) -> int:
+    if resolver is None or priority == 0:
+        return priority
+    try:
+        current = resolver()
+    except Exception:
+        return priority
+    # Ownership callbacks cannot introduce a new execution tier through an
+    # invalid value or stop the shared admission worker.
+    return current if type(current) is int and 0 <= current <= 20 else priority
 
 
 class PriorityLimiter:
@@ -165,12 +178,23 @@ class PriorityLimiter:
 class RequestStart:
     """A reserved connection whose pacing timestamp is committed at HTTP start."""
 
-    def __init__(self, scheduler: RequestScheduler, limiter: PriorityLimiter, category: str | None):
+    def __init__(
+        self,
+        scheduler: RequestScheduler,
+        limiter: PriorityLimiter,
+        category: str | None,
+        priority: int,
+        priority_resolver: Callable[[], int] | None,
+    ):
         self.scheduler, self.limiter, self.category = scheduler, limiter, category
+        self.priority, self.priority_resolver = priority, priority_resolver
         self.future = asyncio.get_running_loop().create_future()
         self.started = asyncio.Event()
         self.reserved = False
         self.queued_at = time.monotonic()
+
+    def current_priority(self) -> int:
+        return resolved_priority(self.priority, self.priority_resolver)
 
     async def start(self) -> None:
         # A server cooldown can arrive while before_attempt is suspended.
@@ -206,11 +230,16 @@ class RequestScheduler:
         self.closed = False
 
     async def acquire(
-        self, limiter: PriorityLimiter, priority: int = 0, category: str | None = None
+        self,
+        limiter: PriorityLimiter,
+        priority: int = 0,
+        category: str | None = None,
+        *,
+        priority_resolver: Callable[[], int] | None = None,
     ) -> RequestStart:
         if self.closed:
             raise asyncio.CancelledError
-        request = RequestStart(self, limiter, category)
+        request = RequestStart(self, limiter, category, priority, priority_resolver)
         limiter.capacity_waiters.add(request.future)
         heapq.heappush(self.queue, (priority, next(self.sequence), request))
         self.changed.set()
@@ -229,7 +258,14 @@ class RequestScheduler:
             for _, _, request in self.queue:
                 if request.future.cancelled():
                     request.limiter.capacity_waiters.discard(request.future)
-            self.queue = [item for item in self.queue if not item[2].future.cancelled()]
+            # A secondary bank can acquire current minimum owners while its
+            # original request waits. Keep that request and FIFO sequence, but
+            # select using current ownership at this admission opportunity.
+            self.queue = [
+                (request.current_priority(), sequence, request)
+                for _, sequence, request in self.queue
+                if not request.future.cancelled()
+            ]
             heapq.heapify(self.queue)
             if not self.queue:
                 break
