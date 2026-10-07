@@ -29,7 +29,7 @@ async def test_expired_dex_bank_keeps_primary_refresh_when_owned_buy_is_current(
     await feed.ingest(published(clock))
     assert not mon.coverage_result_fresh(state)
     mon.sync_primary_banks()
-    router.bank_feed.set_primary.assert_called_once_with({("old", STOCK_MINT, USDC_MINT, 10)})
+    router.bank_feed.set_primary.assert_called_once_with({("old", STOCK_MINT, USDC_MINT, 10): 1})
     assert banks[("old", STOCK_MINT, USDC_MINT, 10)]["response"]["context"]["slot"] == 1
 
 
@@ -60,7 +60,7 @@ async def test_primary_bank_ownership_cannot_survive_invalid_buy_or_minimum(prim
     elif boundary == "grid":
         state.plan["minimum_coverage"] = False
     mon.sync_primary_banks()
-    router.bank_feed.set_primary.assert_called_with(set())
+    router.bank_feed.set_primary.assert_called_with({})
 
 
 async def test_primary_priority_covers_every_leg_of_a_proven_minimum_route(primary_monitor):
@@ -72,5 +72,33 @@ async def test_primary_priority_covers_every_leg_of_a_proven_minimum_route(prima
     state.plan["dex_plan"] = {**leaf, "_direct_route": [leaf, bridge]}
     mon.sync_primary_banks()
     router.bank_feed.set_primary.assert_called_once_with(
-        {("old", STOCK_MINT, USDC_MINT, 10), ("bridge", "SOL", USDC_MINT, 10)}
+        {("old", STOCK_MINT, USDC_MINT, 10): 1, ("bridge", "SOL", USDC_MINT, 10): 1}
+    )
+
+
+async def test_shared_bank_fanout_counts_distinct_minimum_owners_not_duplicate_legs(primary_monitor):
+    mon, clock, feed, router, _, key = primary_monitor
+    router.bank_feed.set_primary = Mock()
+    state = mon.forward_coverage[key[0]]
+    leaf = state.plan["dex_plan"]
+    bridge = {**leaf, "pool": "bridge", "inputMint": "SOL"}
+    state.plan["dex_plan"] = {**leaf, "_direct_route": [leaf, bridge, bridge]}
+    second = replace(state.asset, symbol="SECOND.US")
+    mon.assets[second.symbol] = second
+    mon.chain[second.symbol] = "verified_unit_mapping"
+    feed.tickers.add(second.ticker)
+    await feed.ingest(published(clock, second.ticker))
+    second_state = mon.coverage_state(second)
+    second_state.plan = {
+        **state.plan,
+        "asset": second.symbol,
+        "dex_plan": {**leaf, "_direct_route": [{**leaf, "pool": "second_stock"}, bridge]},
+    }
+    mon.sync_primary_banks()
+    router.bank_feed.set_primary.assert_called_once_with(
+        {
+            ("old", STOCK_MINT, USDC_MINT, 10): 1,
+            ("second_stock", STOCK_MINT, USDC_MINT, 10): 1,
+            ("bridge", "SOL", USDC_MINT, 10): 2,
+        }
     )

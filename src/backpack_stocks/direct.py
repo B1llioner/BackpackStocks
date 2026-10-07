@@ -183,6 +183,9 @@ class DirectRaydium:
         self.gas_discovery_lock = asyncio.Lock()
         self.discovery_lock = asyncio.Lock()
         self.discovery_checked: dict[str, float] = {}
+        self.discovery_retry_at: dict[str, float] = {}
+        self.discovery_failures: dict[str, int] = {}
+        self.discovery_provider_retry_at = 0.0
         self.bank_feed: PoolBankFeed | None = None
         self.array_hints: dict[tuple[str, str], int] = {}
 
@@ -192,24 +195,39 @@ class DirectRaydium:
             self.assets[row["mint"]] = row
             self.by_symbol[row["symbol"]] = row
 
-    async def ensure_candidates(self, mint: str) -> None:
-        if self.candidates.get(mint) and (not self.settings.direct.via_sol or self.sol_candidates.get(mint)):
+    async def ensure_candidates(self, mint: str, *, priority: int = 0, refresh: bool = False) -> None:
+        if (
+            not refresh
+            and self.candidates.get(mint)
+            and (not self.settings.direct.via_sol or self.sol_candidates.get(mint))
+        ):
             return
         # A completed discovery cooldown must not queue behind another stock's
         # slow discovery request. Keep the guarded recheck inside the lock too.
-        if time.time() - self.discovery_checked.get(mint, 0) < 300:
+
+        def cooling_down() -> bool:
+            now = time.time()
+            checked = self.discovery_checked.get(mint)
+            return bool(
+                checked is not None
+                and now - checked < 300
+                or now < self.discovery_retry_at.get(mint, 0)
+                or now < self.discovery_provider_retry_at
+            )
+
+        if cooling_down():
             return
         async with self.discovery_lock:
-            if time.time() - self.discovery_checked.get(mint, 0) < 300:
+            if cooling_down():
                 return
-            self.discovery_checked[mint] = time.time()
-            ray = Raydium(self.rpc, proxy=resolve_proxy("RAYDIUM"))
+            ray: Raydium | None = None
             try:
+                ray = Raydium(self.rpc, proxy=resolve_proxy("RAYDIUM"))
                 for quote_mint, group in [
                     (USDC_MINT, self.candidates),
                     *([(WSOL, self.sol_candidates)] if self.settings.direct.via_sol else []),
                 ]:
-                    if len(group.get(mint, [])) >= self.settings.direct.max_pools:
+                    if not refresh and len(group.get(mint, [])) >= self.settings.direct.max_pools:
                         continue
                     found = await ray.pools(mint, quote_mint)
                     rows = [p for p in found if p["programId"] in {CLMM, CPMM}][
@@ -217,7 +235,8 @@ class DirectRaydium:
                     ]
                     if not rows:
                         continue
-                    response = await self.rpc.accounts([p["id"] for p in rows])
+                    response = await self.rpc.accounts([p["id"] for p in rows], priority=priority)
+                    verified = []
                     for p, account in zip(rows, response["value"], strict=True):
                         if not account or account["owner"] != p["programId"]:
                             continue
@@ -232,11 +251,32 @@ class DirectRaydium:
                             "mintB": state["mintB"],
                             "snapshot": {"state": state},
                         }
-                        group[mint] = list(dict.fromkeys([*group.get(mint, []), address]))[
-                            : self.settings.direct.max_pools
-                        ]
+                        verified.append(address)
+                    references = (
+                        [*verified, *group.get(mint, [])]
+                        if refresh
+                        else [*group.get(mint, []), *verified]
+                    )
+                    group[mint] = list(dict.fromkeys(references))[: self.settings.direct.max_pools]
+                self.discovery_checked[mint] = time.time()
+                self.discovery_retry_at.pop(mint, None)
+                self.discovery_failures.pop(mint, None)
+            except (Exception, asyncio.CancelledError):
+                failures = min(5, self.discovery_failures.get(mint, 0) + 1)
+                self.discovery_failures[mint] = failures
+                now = time.time()
+                delay = min(60, 5 * 2 ** (failures - 1))
+                if ray is not None:
+                    # A new discovery client must not bypass a live server
+                    # cooldown, including when the next lookup is another mint.
+                    cooldown = max(0, ray.http.limiter.blocked_until - time.monotonic())
+                    self.discovery_provider_retry_at = max(self.discovery_provider_retry_at, now + cooldown)
+                    delay = max(delay, cooldown)
+                self.discovery_retry_at[mint] = now + delay
+                raise
             finally:
-                await ray.close()
+                if ray is not None:
+                    await ray.close()
 
     async def register_pool_hints(self, hints: list[dict], assets: list[dict]) -> int:
         """Validate observed pool ownership/pair before adding bounded discovery refs."""
@@ -555,6 +595,7 @@ class DirectRaydium:
         *,
         priority: int = 0,
         _rpc: QuoteAccountBatch | None = None,
+        minimum: bool = False,
     ) -> dict:
         if type(amount) is not int or not 0 < amount < 2**63 or source == target:
             raise ValueError("Invalid exact-in amount/pair")
@@ -564,9 +605,36 @@ class DirectRaydium:
         if USDC_MINT not in {source, target} or stock not in {*self.assets, WSOL}:
             raise ValueError("Direct router supports catalogued stock/USDC pairs only")
         if self.settings.direct.via_sol and stock != WSOL:
-            from .direct_routes import composed_quote
+            from .direct_routes import composed_quote, minimum_quote
 
-            await self.ensure_candidates(stock)
+            minimum_feed = minimum and isinstance(_rpc, PoolBankFeed)
+            if not minimum_feed or not (self.candidates.get(stock) or self.sol_candidates.get(stock)):
+                await self.ensure_candidates(stock, priority=priority)
+
+            if minimum_feed:
+                assert isinstance(_rpc, PoolBankFeed)
+                try:
+                    chosen = await minimum_quote(self, source, target, amount, priority, _rpc)
+                except QuoteUnavailable as error:
+                    if not error.codes or not set(error.codes) <= {
+                        "no_tick_liquidity",
+                        "insufficient_liquidity",
+                    }:
+                        raise
+                    previous = (
+                        tuple(self.candidates.get(stock, [])),
+                        tuple(self.sol_candidates.get(stock, [])),
+                    )
+                    await self.ensure_candidates(stock, priority=priority, refresh=True)
+                    current = (
+                        tuple(self.candidates.get(stock, [])),
+                        tuple(self.sol_candidates.get(stock, [])),
+                    )
+                    if current == previous:
+                        raise
+                    chosen = await minimum_quote(self, source, target, amount, priority, _rpc)
+                _rpc.promote(chosen, priority)
+                return chosen
 
             if _rpc is None:
                 async with self.semaphore, self.batch_quotes() as batch_quote:
@@ -672,7 +740,16 @@ class DirectRaydium:
             if isinstance(_rpc, PoolBankFeed) and _reuse_bank
             else None
         )
-        reuse = bool(previous and previous["program"] == CLMM and previous["array_limit"] == array_limit)
+        if previous and previous["program"] == CLMM and _max_arrays is None:
+            # Amount probes share a hint, but an upward hint alone cannot
+            # invalidate the addresses of the minimum's ready bank. A larger
+            # exact amount still has the explicit full-coverage fallback.
+            array_limit = min(array_limit, previous["array_limit"])
+        reuse = bool(
+            previous
+            and previous["program"] == CLMM
+            and (_max_arrays is None or previous["array_limit"] == array_limit)
+        )
         if reuse:
             assert previous is not None
             # Known addresses only: every account and the directional bitmap
@@ -702,7 +779,7 @@ class DirectRaydium:
             initial_state["mintB"],
         }:
             raise ValueError("Direct pool pair/program mismatch")
-        arrays: list[str] = list(previous["arrays"]) if reuse and previous is not None else []
+        arrays: list[str] = list(previous["arrays"][:array_limit]) if reuse and previous is not None else []
         if program == CLMM and not reuse:
             response = bitmap_response or await rpc.accounts(
                 [pool, bitmap], min_slot=min_slot, priority=priority
@@ -869,6 +946,11 @@ class DirectRaydium:
                 _rpc=banks,
                 _max_arrays=self.settings.direct.max_tick_arrays,
             )
+            if isinstance(banks, PoolBankFeed):
+                # The complete validated bank is independent of this amount's
+                # eventual fill. Publish its head before pure math so baseline
+                # quotes do not compare a new full-bank result with an old head.
+                banks.publish((pool, source, target, priority), bank)
             return await self.quote_bank(pool, source, target, amount, bank)
 
     async def quote_bank(self, pool: str, source: str, target: str, amount: int, bank: dict) -> dict:

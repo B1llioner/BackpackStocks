@@ -195,14 +195,129 @@ async def composed_quote(
 
         paths = await asyncio.gather(*(mixed_path(amount * n // 4) for n in (1, 2, 3)))
         candidates.extend(q for path in paths for q in path)
-    candidates = [
+    current_candidates = [
         q
         for q in candidates
         if 0 <= time.time() - q["_observed_at"] <= router.settings.policy.quote_max_age_s
     ]
+    if len(current_candidates) != len(candidates):
+        codes.append("stale_pool_quote")
+    candidates = current_candidates
     if not candidates:
         raise QuoteUnavailable(codes)
     best = max(candidates, key=lambda q: int(q["otherAmountThreshold"]))
     router.quote_count += 1
     best.update(_request_started_at=started, candidate_routes=len(candidates), quote_source="direct_pools")
     return best
+
+
+async def minimum_quote(
+    router: DirectRaydium, source: str, target: str, amount: int, priority: int, rpc: QuoteAccountBatch
+) -> dict:
+    """Publish the first complete exact minimum; remaining bounded probes drain in the root batch."""
+    from .direct import QuoteUnavailable
+
+    if (
+        target != USDC_MINT
+        or source in {USDC_MINT, WSOL}
+        or type(amount) is not int
+        or not 0 < amount < 2**63
+    ):
+        raise ValueError("Minimum route requires a positive stock-to-USDC amount")
+    started = time.time()
+    count = min(2, router.settings.direct.max_pools)
+    direct = list(dict.fromkeys(router.candidates.get(source, [])))[:count]
+    sol = (
+        list(dict.fromkeys(router.sol_candidates.get(source, [])))[:count]
+        if router.settings.direct.via_sol
+        else []
+    )
+    tracker = rpc
+    parent = getattr(tracker, "rpc", None)
+    while isinstance(parent, QuoteAccountBatch):
+        tracker = parent
+        parent = getattr(tracker, "rpc", None)
+
+    async def calculate(pool, a, b, units):
+        try:
+            return await router.pool_quote(pool, a, b, units, priority=priority, _rpc=rpc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            code = error_code(error)
+            router.failures += 1
+            event(
+                "pool_quote_blocked" if code in MARKET_BLOCKS else "pool_quote_error",
+                level="INFO" if code in MARKET_BLOCKS else "ERROR",
+                pool=pool,
+                code=code,
+                error_type=type(error).__name__,
+            )
+            raise
+
+    bridge_task: asyncio.Task | None = None
+
+    async def via(first_pool, bridge_index):
+        nonlocal bridge_task
+        first = await calculate(first_pool, source, WSOL, amount)
+        if bridge_task is None:
+            # Direct routes do not wait for optional bridge discovery. All via
+            # paths share its one request, including an empty/failed result.
+            bridge_task = asyncio.create_task(router.bridge_pools())
+            tracker.tasks.add(bridge_task)
+            bridge_task.add_done_callback(drained)
+        bridges = list(dict.fromkeys(await asyncio.shield(bridge_task)))[:2]
+        if bridge_index >= len(bridges):
+            raise QuoteUnavailable([])
+        bridge = bridges[bridge_index]
+        second = await calculate(bridge, WSOL, target, int(first["outAmount"]))
+        return combine([first, second], sequential=True)
+
+    def drained(task):
+        tracker.tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    jobs = [calculate(pool, source, target, amount) for pool in direct]
+    jobs.extend(via(pool, index) for pool in sol for index in range(2))
+    pending = set()
+    for job in jobs:
+        task = asyncio.create_task(job)
+        tracker.tasks.add(task)
+        task.add_done_callback(drained)
+        pending.add(task)
+    codes = []
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        ready = []
+        for task in done:
+            if task.cancelled():
+                continue
+            error = task.exception()
+            if error is not None:
+                codes.extend(error.codes if isinstance(error, QuoteUnavailable) else [error_code(error)])
+                continue
+            quote = task.result()
+            if not 0 <= time.time() - quote["_observed_at"] < router.settings.policy.quote_max_age_s:
+                codes.append("stale_pool_quote")
+                continue
+            if (
+                quote["inputMint"] != source
+                or quote["outputMint"] != target
+                or int(quote["inAmount"]) != amount
+                or not 0 < int(quote["otherAmountThreshold"]) <= int(quote["outAmount"]) < 2**63
+            ):
+                codes.append("clmm_input_mismatch")
+                continue
+            ready.append(quote)
+        if ready:
+            best = max(ready, key=lambda quote: int(quote["otherAmountThreshold"]))
+            router.quote_count += 1
+            best.update(_request_started_at=started, candidate_routes=len(ready), quote_source="direct_pools")
+            promote = getattr(tracker, "promote", None)
+            if promote is not None:
+                promote(best, priority)
+            # Cancelling losers would kill active SDK pipes. They remain owned
+            # by the root batch, consume their errors, and stop at root close.
+            return best
+    raise QuoteUnavailable(codes)

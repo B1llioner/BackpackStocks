@@ -1,4 +1,5 @@
-from datetime import UTC, datetime, timedelta
+from copy import deepcopy
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .models import dec
@@ -13,7 +14,11 @@ def active_session(sessions: list[dict], holidays: list[dict], now: datetime | N
         if local.date().isoformat() != holiday["date"]:
             continue
         start, end = holiday.get("startTime"), holiday.get("endTime")
-        if start is None or end is None or start <= local.strftime("%H:%M:%S") < end:
+        if (
+            start is None
+            or end is None
+            or time.fromisoformat(start) <= local.time() < time.fromisoformat(end)
+        ):
             return None
     for session in sessions:
         local = now.astimezone(ZoneInfo(session["timezone"]))
@@ -34,6 +39,52 @@ def active_session(sessions: list[dict], holidays: list[dict], now: datetime | N
             if allowed and start <= local < end:
                 return session["name"]
     return None
+
+
+class ActiveSessionCache:
+    """Reuse a calendar decision within a second, never across changed inputs or boundaries."""
+
+    def __init__(self):
+        self.sessions: list[dict] | None = None
+        self.holidays: list[dict] | None = None
+        self.bucket: tuple | None = None
+        self.last_now: datetime | None = None
+        self.session: str | None = None
+        self.fractional = False
+
+    def get(self, sessions: list[dict], holidays: list[dict], now: datetime) -> str | None:
+        # C-level content comparisons avoid reparsing every calendar per asset.
+        # Deep snapshots also detect nested in-place changes; metadata freshness
+        # and asset quantity rules remain the caller's live checks.
+        unchanged = sessions == self.sessions and holidays == self.holidays
+        if not unchanged:
+            fractional = any(
+                isinstance(value, str) and ("." in value or "," in value)
+                for row in [*sessions, *holidays]
+                for value in (row.get("startTime"), row.get("endTime"))
+            )
+        else:
+            fractional = self.fractional
+        utc = now if now.tzinfo is UTC else now.astimezone(UTC)
+        bucket = utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second
+        if (
+            unchanged
+            and bucket == self.bucket
+            and self.last_now is not None
+            and utc >= self.last_now
+            and not fractional
+            and now.tzinfo is not None
+        ):
+            self.last_now = utc
+            return self.session
+        # Fractional schedules always take the exact original path. Cache state
+        # is committed only after successful parsing/evaluation, including closed.
+        session = active_session(sessions, holidays, now)
+        if not unchanged:
+            self.sessions, self.holidays = deepcopy(sessions), deepcopy(holidays)
+        self.bucket, self.last_now = bucket, utc
+        self.session, self.fractional = session, fractional
+        return session
 
 
 def next_session_open(

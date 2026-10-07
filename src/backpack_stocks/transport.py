@@ -4,7 +4,7 @@ import asyncio
 import math
 import random
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -99,6 +99,13 @@ class Transport:
         return {
             **self.limiter.status(),
             "responses_429_all_buckets": self.responses_429,
+            "queued_by_priority": dict(
+                Counter(
+                    str(priority)
+                    for priority, _, request in self.requests.queue
+                    if not request.future.cancelled()
+                )
+            ),
             "max_connections": 8,
             "response_cap_bytes": self.max_response_bytes,
             "byte_budget_per_30s": self.byte_budget,

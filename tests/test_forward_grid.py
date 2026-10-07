@@ -102,7 +102,7 @@ async def test_larger_grid_cannot_mark_an_old_minimum_as_repriced_on_a_new_bank(
     mon.rfq.check.assert_not_awaited()
 
 
-async def test_minimum_marker_records_the_public_price_used_before_an_inflight_tick(
+async def test_minimum_reprices_to_the_latest_public_price_after_an_inflight_tick(
     public_direct_monitor,
 ):
     mon, clock, feed, router, _, key = public_direct_monitor
@@ -123,9 +123,9 @@ async def test_minimum_marker_records_the_public_price_used_before_an_inflight_t
         quote_pair=partial(router.cached_plan_quote, plan=state.plan["dex_plan"]),
     )
 
-    assert row and row["backpack_price"] == "6.2"
-    assert mon.local_inputs[key] == calculated_marker
-    assert mon.local_input_version(key, state.plan) != calculated_marker
-    assert mon.snapshot()["forward_coverage"]["pricedfresh"] == 0
+    assert row and row["backpack_price"] == "6.3"
+    assert row["cost_raw"] == 1_008_000  # The same exact 0.16 shares at the newly observed limit.
+    assert mon.local_inputs[key] != calculated_marker
+    assert mon.local_input_version(key, state.plan) == mon.local_inputs[key]
+    assert mon.snapshot()["forward_coverage"]["pricedfresh"] == 1
     mon.rfq.check.assert_not_awaited()
-
