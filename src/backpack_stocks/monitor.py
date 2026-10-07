@@ -938,8 +938,15 @@ class SpreadMonitor:
     def choose_forward_coverage(
         self, *, ignore_pending: tuple[str, str] | None = None
     ) -> tuple[str, str] | None:
+        available = self.forward_coverage_candidates(ignore_pending=ignore_pending)
+        return (min(available)[2], FORWARD) if available else None
+
+    def forward_coverage_candidates(
+        self, *, ignore_pending: tuple[str, str] | None = None
+    ) -> list[tuple[bool, float, str]]:
+        """Validate current minimum owners before ranking a dispatch batch."""
         if not self.forward_coverage_enabled:
-            return None
+            return []
         available = []
         now = self.clock()
         for asset in self.assets.values():
@@ -994,7 +1001,7 @@ class SpreadMonitor:
             # After every first attempt, incomplete routes join the same age
             # queue; repeatedly missing banks cannot starve already priced assets.
             available.append((bool(state.attempted_at), state.attempted_at, asset.symbol))
-        return (min(available)[2], FORWARD) if available else None
+        return available
 
     async def discover_coverage_route(self, state: ForwardCoverage) -> None:
         """Explore one fixed minimum in the background; never publish its price."""
@@ -2493,6 +2500,18 @@ class SpreadMonitor:
             if coverage_state:
                 coverage_state.reason = error_code(error)
             if local_plan is not None:
+                if (
+                    coverage_state is not None
+                    and coverage
+                    and local_plan.get("minimum_coverage")
+                    and local_plan.get("acquired_raw") == coverage_state.quantity_raw
+                    and error_code(error) == "insufficient_tick_coverage"
+                    and (bank_key := getattr(error, "bank_key", None)) is not None
+                    and callable(request := getattr(self.quote_provider, "request_minimum_expansion", None))
+                ):
+                    # Enqueue one owned background bank expansion. Extra local
+                    # slots never await RPC or fall back to network routing.
+                    request(bank_key)
                 event("local_quote_unavailable", asset=symbol, direction=direction, code=error_code(error))
                 return None
             code = error_code(error)
@@ -2695,6 +2714,7 @@ class SpreadMonitor:
     def sync_primary_banks(self) -> None:
         """Prioritize current minimum routes even while their DEX banks expire."""
         from .direct import DirectRaydium
+        from .raydium import CLMM
 
         provider = self.quote_provider
         if not self.forward_coverage_enabled or not isinstance(provider, DirectRaydium):
@@ -2703,6 +2723,24 @@ class SpreadMonitor:
         if feed is None or not hasattr(feed, "set_primary"):
             return
         primary: Counter[tuple[str, str, str, int]] = Counter()
+        minimum_arrays: dict[tuple[str, str, str, int], int] = {}
+        unresolved: set[tuple[str, str, str, int]] = set()
+
+        def owned_arrays(route: dict) -> dict[tuple[str, str, str, int], int]:
+            requirements: dict[tuple[str, str, str, int], int] = {}
+            legs = route.get("_direct_route")
+            if legs:
+                for leg in legs:
+                    for key, limit in owned_arrays(leg).items():
+                        requirements[key] = max(requirements.get(key, 0), limit)
+            else:
+                direct = route.get("_direct", {})
+                arrays = direct.get("arrays")
+                if direct.get("program") == CLMM and isinstance(arrays, (list, tuple)) and arrays:
+                    key = route["pool"], route["inputMint"], route["outputMint"], 10
+                    requirements[key] = min(self.settings.direct.max_tick_arrays, max(2, len(arrays) + 1))
+            return requirements
+
         for state in self.forward_coverage.values():
             plan = state.plan
             if (
@@ -2725,13 +2763,30 @@ class SpreadMonitor:
                 self.coverage_observation(state.asset)
                 if plan["backpack_session"] != state.session:
                     continue
-                primary.update({
-                    (pool, source, target, 10)
-                    for pool, source, target, _, _ in provider.bank_versions(plan["dex_plan"])
-                })
+                primary.update(
+                    {
+                        (pool, source, target, 10)
+                        for pool, source, target, _, _ in provider.bank_versions(plan["dex_plan"])
+                    }
+                )
+                for pool, source, target, slot, observed in provider.bank_versions(plan["dex_plan"]):
+                    key = pool, source, target, 10
+                    bank = feed.peek(key)
+                    if (
+                        bank is None
+                        or not 0 <= self.clock() - bank["observed"] < self.settings.policy.quote_max_age_s
+                        or observed != bank["observed"]
+                        or slot != bank["response"]["context"]["slot"]
+                    ):
+                        unresolved.add(key)
+                for key, limit in owned_arrays(plan["dex_plan"]).items():
+                    minimum_arrays[key] = max(minimum_arrays.get(key, 0), limit)
             except (ValueError, KeyError, TypeError, ArithmeticError):
                 continue
         feed.set_primary(primary)
+        set_arrays = getattr(feed, "set_minimum_arrays", None)
+        if set_arrays is not None:
+            set_arrays(minimum_arrays, resolved=set(primary) - unresolved)
 
     async def schedule_quotes(self, quote_pair: Callable[..., Awaitable[dict]] | None = None) -> None:
         from .direct import DirectRaydium
@@ -2764,6 +2819,11 @@ class SpreadMonitor:
                 and isinstance(provider, DirectRaydium)
                 and provider.bank_feed is not None
             )
+            # Dispatching this batch has no await. WS, metadata and bank inputs
+            # cannot change until we yield, so validate each owner/version once.
+            coverage_candidates: list[tuple[bool, float, str]] | None = None
+            plans: dict[tuple[str, str], dict] | None = None
+            ready_local_inputs: list[tuple[tuple[str, str], tuple]] | None = None
             while not self.reporting and (
                 len(self.pending) < concurrency
                 or extra_minimum_lane
@@ -2774,7 +2834,16 @@ class SpreadMonitor:
                 from .direct import DirectRaydium
 
                 network_room = len(self.pending) < concurrency
-                coverage_key = self.choose_forward_coverage() if network_room else None
+                coverage_key = None
+                if network_room:
+                    if coverage_candidates is None:
+                        coverage_candidates = self.forward_coverage_candidates()
+                    candidate = min(
+                        (row for row in coverage_candidates if (row[2], FORWARD) not in self.pending),
+                        default=None,
+                    )
+                    if candidate is not None:
+                        coverage_key = candidate[2], FORWARD
                 initial_started = self.forward_coverage_enabled and all(
                     self.forward_coverage.get(asset.symbol)
                     and self.forward_coverage[asset.symbol].attempted_at
@@ -2793,36 +2862,43 @@ class SpreadMonitor:
                     )
                 )
                 reserved_selection = self.choose() if reserve_search else None
-                plans = dict(self.local_plans)
-                if self.forward_coverage_enabled:
-                    plans.update(
-                        {
-                            (symbol, FORWARD): state.plan
-                            for symbol, state in self.forward_coverage.items()
-                            if state.plan is not None
-                        }
-                    )
-                local_keys = []
-                if (
-                    isinstance(provider, DirectRaydium)
-                    and provider.bank_feed is not None
-                    and len(self.local_pending) < local_limit
-                ):
-                    now = self.clock()
-                    possible = [
-                        key
-                        for key, plan in plans.items()
-                        if key not in self.pending
-                        and key[0] in self.assets
-                        and now >= self.local_after.get(key, 0)
-                        and plan["mint"] == self.assets[key[0]].mint
-                        and plan["backpack_source"] in {"rfq", "spot", "indicative"}
-                        and ("_direct" in plan["dex_plan"] or "_direct_route" in plan["dex_plan"])
-                    ]
-                    for key in possible:
-                        local_version = self.local_input_version(key, plans[key])
-                        if local_version is not None and local_version != self.local_inputs.get(key):
-                            local_keys.append((key, local_version))
+                if plans is None:
+                    plans = dict(self.local_plans)
+                    if self.forward_coverage_enabled:
+                        plans.update(
+                            {
+                                (symbol, FORWARD): state.plan
+                                for symbol, state in self.forward_coverage.items()
+                                if state.plan is not None
+                            }
+                        )
+                if ready_local_inputs is None:
+                    ready_local_inputs = []
+                    if (
+                        isinstance(provider, DirectRaydium)
+                        and provider.bank_feed is not None
+                        and len(self.local_pending) < local_limit
+                    ):
+                        now = self.clock()
+                        possible = [
+                            key
+                            for key, plan in plans.items()
+                            if key not in self.pending
+                            and key[0] in self.assets
+                            and now >= self.local_after.get(key, 0)
+                            and plan["mint"] == self.assets[key[0]].mint
+                            and plan["backpack_source"] in {"rfq", "spot", "indicative"}
+                            and ("_direct" in plan["dex_plan"] or "_direct_route" in plan["dex_plan"])
+                        ]
+                        for key in possible:
+                            local_version = self.local_input_version(key, plans[key])
+                            if local_version is not None and local_version != self.local_inputs.get(key):
+                                ready_local_inputs.append((key, local_version))
+                local_keys = (
+                    [row for row in ready_local_inputs if row[0] not in self.pending]
+                    if len(self.local_pending) < local_limit
+                    else []
+                )
                 ready_minimum = [row for row in local_keys if plans[row[0]].get("minimum_coverage")]
                 if not network_room:
                     # These extra slots only consume already owned public

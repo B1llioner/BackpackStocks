@@ -57,6 +57,15 @@ FIELDS = {
     "minimum_output_raw",
     "quantity",
     "signature",
+    "observed_at",
+    "eligible",
+    "fresh",
+    "refused",
+    "known_blocks",
+    "waiting_bank",
+    "waiting_assets",
+    "first_pass_completed",
+    "snapshot_ms",
 }
 REASONS = {
     "Pool swaps disabled": "pool_disabled",

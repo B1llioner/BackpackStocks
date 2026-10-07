@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
 
@@ -25,7 +26,11 @@ class PoolBankFeed(QuoteAccountBatch):
         self.hot: dict[BankKey, float] = {}
         self.primary: frozenset[BankKey] | None = None
         self.primary_counts: dict[BankKey, int] = {}
+        self.minimum_arrays: dict[BankKey, int] = {}
+        self.minimum_expansion_limits: dict[BankKey, int] = {}
+        self.expansion_tasks: dict[BankKey, asyncio.Task] = {}
         self.retry_at: dict[BankKey, float] = {}
+        self.failure_at: dict[BankKey, float] = {}
         self.received_at: dict[BankKey, float] = {}
         self.timer = timer
         # Allow a whole monitoring round to reach the coalescer. RPC traffic
@@ -108,6 +113,7 @@ class PoolBankFeed(QuoteAccountBatch):
         accepted = self._remember(key, bank)
         if accepted:
             self.retry_at.pop(key, None)
+            self.failure_at.pop(key, None)
             self.changed.set()
         return accepted
 
@@ -174,12 +180,142 @@ class PoolBankFeed(QuoteAccountBatch):
             if key in self.producers and type(count) is int and count > 0
         }
         self.primary = frozenset(self.primary_counts)
+        self.minimum_arrays = {
+            key: limit for key, limit in self.minimum_arrays.items() if key in self.primary
+        }
+        self.minimum_expansion_limits = {
+            key: limit for key, limit in self.minimum_expansion_limits.items() if key in self.primary
+        }
+        for key in self.primary:
+            failed = self.failure_at.get(key)
+            if failed is not None and key in self.retry_at:
+                # Promotion changes only this bank's background retry. The RPC
+                # transport still owns any account-wide HTTP cooldown.
+                self.retry_at[key] = min(self.retry_at[key], failed + 5)
+
+    def set_minimum_arrays(self, limits: Mapping[BankKey, int], *, resolved: Iterable[BankKey] = ()) -> None:
+        """Replace requirements; clear expansions only for caller-verified current owners."""
+        self.minimum_arrays = {
+            key: limit
+            for key, limit in limits.items()
+            if self.primary is not None
+            and key in self.primary
+            and key in self.producers
+            and type(limit) is int
+            and 1 <= limit <= 12
+        }
+        for key in resolved:
+            self.minimum_expansion_limits.pop(key, None)
+
+    def request_minimum_expansion(self, key: BankKey, limit: int) -> bool:
+        """Queue one complete bank expansion for an active minimum dependency."""
+        if (
+            self.primary is None
+            or key not in self.primary
+            or key not in self.producers
+            or type(limit) is not int
+            or not 1 <= limit <= 12
+        ):
+            return False
+        self.minimum_expansion_limits[key] = max(limit, self.minimum_expansion_limits.get(key, 0))
+        task = self.expansion_tasks.get(key)
+        if task is not None and not task.done():
+            return True
+        if self.timer() < self.retry_at.get(key, 0):
+            return False
+        previous_task = self.pool_banks.get(key)
+
+        async def expand():
+            # Install this task as the bank owner immediately, but allow the
+            # older read to finish. Other callers join us rather than duplicate it.
+            token = REFRESHING.set(True)
+            priority_token = REFRESH_PRIORITY.set(self.refresh_priority(key))
+            previous = self.ready.get(key)
+            owned_bank = None
+            try:
+                if previous_task is not None and not previous_task.done():
+                    await asyncio.shield(previous_task)
+                previous = self.ready.get(key)
+                while True:
+                    required = self.minimum_expansion_limits.get(key)
+                    if self.primary is None or key not in self.primary or required is None:
+                        if self.ready.get(key) is not None:
+                            return self.ready[key]
+                        raise ValueError("Minimum pool bank no longer active")
+                    if self.timer() < self.retry_at.get(key, 0):
+                        raise ValueError("Minimum pool bank refresh cooling down")
+                    current = self.peek(key)
+                    if (
+                        current is not None
+                        and type(current.get("array_limit")) is int
+                        and current["array_limit"] >= required
+                    ):
+                        return current
+                    async with self.limit:
+                        bank = await self.producers[key]()
+                    owned_bank = bank
+                    self.publish(key, bank)
+                    self.refreshed += 1
+                    current = self.peek(key)
+                    if (
+                        current is None
+                        or type(current.get("array_limit")) is not int
+                        or current["array_limit"] < required
+                    ):
+                        raise ValueError("Minimum pool bank expansion is not usable")
+                    # If another owner requested a larger bank during this read,
+                    # continue sequentially under the same deduplicated task.
+                    if self.minimum_expansion_limits.get(key, 0) <= required:
+                        return self.ready.get(key, bank)
+                    previous = self.ready.get(key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if (
+                    self.ready.get(key) is previous
+                    or self.ready.get(key) is owned_bank
+                    or self.ready.get(key) is None
+                ):
+                    self.record_failure(key)
+                event("pool_bank_refresh_blocked", pool=key[0], code=error_code(error))
+                raise
+            finally:
+                REFRESH_PRIORITY.reset(priority_token)
+                REFRESHING.reset(token)
+
+        task = asyncio.create_task(expand())
+        self.expansion_tasks[key] = task
+        self.pool_banks[key] = task
+        self.tasks.add(task)
+
+        def finished(completed: asyncio.Task) -> None:
+            self.tasks.discard(completed)
+            if self.expansion_tasks.get(key) is completed:
+                self.expansion_tasks.pop(key, None)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(finished)
+        return True
+
+    def record_failure(self, key: BankKey) -> None:
+        failed = self.timer()
+        self.failure_at[key] = failed
+        secondary = self.primary is not None and key not in self.primary
+        self.retry_at[key] = failed + (30 if secondary else 5)
 
     def refresh_priority(self, key: BankKey) -> int:
         if self.primary is None:
             return 5
         owners = self.primary_counts.get(key, 0)
         return 3 if owners > 1 else 5 if owners == 1 else 10
+
+    def refresh_period(self, key: BankKey) -> float:
+        if self.primary is None or key in self.primary:
+            return self.max_age / 2
+        # Retained alternative plans remain discoverable without continuously
+        # refreshing their larger banks. On-demand reads still require freshness.
+        return 30.0
 
     def promote(self, quote: dict, priority: int) -> None:
         for leg in quote["routePlan"]:
@@ -203,10 +339,10 @@ class PoolBankFeed(QuoteAccountBatch):
                     continue
                 # Chain Clock may already lag wall time by several seconds on
                 # receipt. It measures price freshness, not read scheduling.
-                # Reserve half the unchanged TTL for the paced RPC round and
-                # complete-bank validation. Polling every quarter-TTL doubled
-                # that work and could expire the previous bank in its queue.
-                if bank and elapsed - self.received_at.get(key, float("-inf")) < self.max_age / 2:
+                # Primary banks reserve half the unchanged TTL for the paced
+                # RPC round and validation; retained alternatives refresh less
+                # often but expire under the same strict quote-age check.
+                if bank and elapsed - self.received_at.get(key, float("-inf")) < self.refresh_period(key):
                     continue
                 due.append(key)
             for key in sorted(
@@ -231,7 +367,7 @@ class PoolBankFeed(QuoteAccountBatch):
                     except Exception as error:
                         if self.ready.get(key) is previous:
                             self.ready.pop(key, None)
-                            self.retry_at[key] = self.timer() + 5
+                            self.record_failure(key)
                         event("pool_bank_refresh_blocked", pool=key[0], code=error_code(error))
                         raise
                     finally:
@@ -249,6 +385,7 @@ class PoolBankFeed(QuoteAccountBatch):
 
     def status(self):
         ages = sorted(time.time() - self.ready[key]["observed"] for key in self.hot if key in self.ready)
+        primary = self.primary if self.primary is not None else self.hot.keys()
         return {
             "hot_banks": len(self.hot),
             "fresh_banks": sum(self.peek(key) is not None for key in self.hot),
@@ -256,6 +393,10 @@ class PoolBankFeed(QuoteAccountBatch):
             "local_quotes": self.local_quotes,
             "bank_age_median_s": ages[len(ages) // 2] if ages else None,
             "bank_age_max_s": max(ages) if ages else None,
+            "primary_banks": len(primary),
+            "fresh_primary_banks": sum(self.peek(key) is not None for key in primary),
+            "minimum_array_limits": dict(Counter(self.minimum_arrays.values())),
+            "minimum_expansion_banks": len(self.minimum_expansion_limits),
         }
 
     async def close(self):

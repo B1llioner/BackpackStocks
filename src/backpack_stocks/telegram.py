@@ -214,7 +214,10 @@ class TelegramAPI:
         chunks.append(text)
         for chunk in chunks:
             await self.call(
-                "sendMessage", chat_id=user_id, text=chunk, protect_content=True,
+                "sendMessage",
+                chat_id=user_id,
+                text=chunk,
+                protect_content=True,
                 link_preview_options={"is_disabled": True},
             )
         return original
@@ -636,7 +639,11 @@ class TelegramController:
                 groups: list[list[str]] = []
                 group: list[str] = []
                 for item in symbols:
-                    if group and len(monitor.prices_text([*group, item], page=999, total=999, snapshot=snapshot)) > 3700:
+                    if (
+                        group
+                        and len(monitor.prices_text([*group, item], page=999, total=999, snapshot=snapshot))
+                        > 3700
+                    ):
                         groups.append(group)
                         group = []
                     group.append(item)
@@ -949,6 +956,148 @@ async def report_worker(bot: TelegramController) -> None:
     previous = None
     last_digest = 0.0
     last_snapshot = 0.0
+    last_rendered: float | None = None
+    rendered_in = 0.0
+    snapshot: dict | None = None
+    previous_monitor = None
+    positive_inputs: dict[tuple, set[tuple]] = {}
+    spot_values: dict[int, tuple[dict, tuple, dict | None]] = {}
+
+    def new_positive(monitor) -> bool:
+        """Wake reports for new potential signals; the snapshot decides eligibility."""
+        nonlocal positive_inputs, spot_values
+        current: dict[tuple, set[tuple]] = {}
+        current_spots: dict[int, tuple[dict, tuple, dict | None]] = {}
+        urgent = False
+        if engine.settings.telegram_spread_alerts:
+            rows = list(getattr(monitor, "results", {}).values())
+            rows.extend(
+                state.result
+                for state in getattr(monitor, "forward_coverage", {}).values()
+                if state.result is not None
+            )
+            for row in rows:
+                source = row.get("backpack_source")
+                if source == "spot" and callable(revalue := getattr(monitor, "revalue_book", None)):
+                    original = row
+                    try:
+                        symbol = row["asset"]
+                        asset, books = monitor.assets[symbol], monitor.books
+                        depth = books.depth(symbol)  # Check original book/fee TTL, never refresh them.
+                        capacity = books.capacities.get(
+                            (symbol, "Bid" if row["direction"] == "backpack_to_jupiter" else "Ask")
+                        )
+                        if row["direction"] == "backpack_to_jupiter" and (
+                            capacity is None
+                            or not 0 <= monitor.clock() - capacity.checked_at < books.ttl
+                            or not 0 <= monitor.clock() - row["book_capacity_checked_at"] < books.ttl
+                        ):
+                            continue
+                        p = monitor.settings.policy
+                        version = (
+                            id(asset),
+                            books.markets[symbol],
+                            id(depth),
+                            depth.timestamp,
+                            depth.update_id,
+                            books.fee_at,
+                            books.fee_bps,
+                            capacity,
+                            tuple(
+                                row.get(field)
+                                for field in (
+                                    "asset",
+                                    "direction",
+                                    "mint",
+                                    "acquired_raw",
+                                    "sellable_raw",
+                                    "input_raw",
+                                    "minimum_output_raw",
+                                    "cost_raw",
+                                    "proceeds_raw",
+                                    "gas_raw",
+                                    "dex_observed_at",
+                                    "backpack_market",
+                                    "book_capacity_checked_at",
+                                    "dex_price_impact_pct",
+                                    "slippage_bps",
+                                    "search_budget_usdc",
+                                    "backpack_model",
+                                )
+                            ),
+                            tuple(tuple(value) for value in row.get("dex_bank_versions", [])),
+                            monitor.settings.monitor.auto_size,
+                            p.max_cost_usdc,
+                            p.min_profit_usdc,
+                            p.min_edge_bps,
+                            p.max_price_impact_pct,
+                            p.slippage_bps,
+                        )
+                    except (ValueError, KeyError, TypeError, ArithmeticError):
+                        continue
+                    cached = spot_values.get(id(original))
+                    if cached is not None and cached[0] is original and cached[1] == version:
+                        valued = cached[2]
+                    else:
+                        try:
+                            valued = revalue(asset, original)
+                        except (ValueError, KeyError, TypeError, ArithmeticError):
+                            valued = None
+                    current_spots[id(original)] = original, version, valued
+                    if valued is None:
+                        continue
+                    row = valued
+                if (
+                    row.get("profit_raw", 0) <= 0
+                    or source == "indicative"
+                    or not (
+                        row.get("backpack_quote_confirmed")
+                        or source == "spot"
+                        or not engine.settings.monitor.rfq_validation
+                    )
+                ):
+                    continue
+                key = (
+                    row["asset"],
+                    row["direction"],
+                    row.get("acquired_raw"),
+                    row.get("sellable_raw"),
+                    row.get("input_raw"),
+                    source,
+                )
+                fingerprint = (
+                    row.get("backpack_timestamp"),
+                    row.get("backpack_price"),
+                    row.get("dex_observed_at"),
+                    tuple(tuple(version) for version in row.get("dex_bank_versions", [])),
+                    row.get("profit_raw"),
+                    row.get("cost_raw"),
+                    row.get("passes_model_limits"),
+                    row.get("trading_supported"),
+                    row.get("size_feasible"),
+                    row.get("account_withdrawal_verified"),
+                    row.get("backpack_quote_confirmed"),
+                )
+                current.setdefault(key, set()).add(fingerprint)
+            for key, fingerprints in current.items():
+                if positive_inputs.get(key) == fingerprints:
+                    continue
+                # The raw row does not yet know candidate/restricted status.
+                # Either unsuppressed alert key conservatively wakes a fresh
+                # snapshot, including a newly qualified restricted opportunity.
+                base = f"spread_alert:{key[0]}:{key[1]}"
+                for alert_key in (base, base + ":restricted"):
+                    delivered_at = float(engine.store.get_meta(alert_key) or "0")
+                    if (
+                        alert_key not in bot.pending_alerts
+                        and bot.clock() - delivered_at >= engine.settings.telegram_alert_cooldown_s
+                    ):
+                        urgent = True
+                        break
+        positive_inputs = current
+        spot_values = current_spots
+        return urgent
+
     await asyncio.sleep(1)
     while True:
         status = engine.status()
@@ -956,11 +1105,48 @@ async def report_worker(bot: TelegramController) -> None:
         marker = (active["id"], active["phase"]) if active else (None, len(status["cycles"]))
         now = time.time()
         monitor = engine.monitor
+        digest_due = marker != previous or bool(
+            engine.settings.telegram_digest_s and now - last_digest >= engine.settings.telegram_digest_s
+        )
+        disk_due = now - last_snapshot >= 10
+        if monitor is not previous_monitor:
+            previous_monitor = monitor
+            last_rendered, snapshot, positive_inputs, spot_values = None, None, {}, {}
         if monitor:
             monitor.updated.clear()
-            snapshot = monitor.snapshot()
-            await bot.announce_candidates(snapshot)
-            if now - last_snapshot >= 10:
+            urgent = new_positive(monitor)
+            if (
+                last_rendered is None
+                or time.monotonic() - last_rendered >= 1
+                or digest_due
+                or disk_due
+                or urgent
+            ):
+                started = time.perf_counter()
+                snapshot = monitor.snapshot()
+                rendered_in = time.perf_counter() - started
+                last_rendered = time.monotonic()
+                coverage = snapshot.get("forward_coverage", {})
+                if coverage.get("enabled"):
+                    event(
+                        "coverage_frame",
+                        observed_at=snapshot["observed_at"],
+                        eligible=coverage["eligible"],
+                        fresh=coverage["pricedfresh"],
+                        refused=coverage["refused"],
+                        known_blocks=coverage["known_blocks"],
+                        waiting_bank=coverage["waitingbank"],
+                        waiting_assets=",".join(
+                            row["asset"]
+                            for row in coverage.get("rows", [])
+                            if row["state"].startswith("waiting")
+                        ),
+                        first_pass_completed=coverage["first_pass_completed"],
+                        snapshot_ms=rendered_in * 1000,
+                    )
+                await bot.announce_candidates(snapshot)
+            assert snapshot is not None
+            if disk_due:
                 last_snapshot = now
                 root = Path(engine.settings.database).resolve().parent
                 target = root / "direct-monitor.json"
@@ -986,13 +1172,20 @@ async def report_worker(bot: TelegramController) -> None:
                     ),
                     cycles=len(status["cycles"]),
                 )
-        if marker != previous or (
-            engine.settings.telegram_digest_s and now - last_digest >= engine.settings.telegram_digest_s
-        ):
+        if digest_due:
             previous, last_digest = marker, now
             if monitor:
                 try:
-                    report = monitor.report()
+                    assert snapshot is not None
+                    report = {
+                        **snapshot,
+                        "report_source": "background_cache",
+                        "report_duration_s": rendered_in,
+                    }
+                    monitor.last_report = {
+                        key: report[key]
+                        for key in ("observed_at", "report_source", "report_duration_s", "fresh_calculations")
+                    }
                     text = monitor.text(snapshot=report)
                 except Exception as error:
                     event("monitor_report_error", level="ERROR", code=type(error).__name__)
@@ -1007,7 +1200,9 @@ async def report_worker(bot: TelegramController) -> None:
             )
         if monitor:
             try:
-                await asyncio.wait_for(monitor.updated.wait(), timeout=min(engine.settings.poll_s, 0.5))
+                assert last_rendered is not None
+                timeout = min(engine.settings.poll_s, 0.5, max(0.001, last_rendered + 1 - time.monotonic()))
+                await asyncio.wait_for(monitor.updated.wait(), timeout=timeout)
             except TimeoutError:
                 pass
         else:

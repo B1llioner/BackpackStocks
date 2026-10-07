@@ -22,7 +22,7 @@ from solders.pubkey import Pubkey
 from .clmm_worker import ClmmCalculationError, ClmmWorkerPool
 from .models import ATA, STOCK_MINT, TOKEN, TOKEN_2022, USDC_MINT, Settings, dec
 from .observability import MARKET_BLOCKS, QuoteUnavailable, error_code, event
-from .pool_bank_feed import PoolBankFeed
+from .pool_bank_feed import BankKey, PoolBankFeed
 from .pool_catalog import CLOCK, SYSVAR, mint_capabilities, transfer_fee_profile
 from .pool_compute import PoolCalculator, PreparedCpmmPools
 from .pool_math import spot_b_per_a
@@ -40,9 +40,10 @@ WSOL = "So11111111111111111111111111111111111111112"
 class LocalQuoteNotReady(QuoteUnavailable):
     code = "pool_bank_not_ready"
 
-    def __init__(self):
-        super().__init__([self.code])
-        self.code = "pool_bank_not_ready"
+    def __init__(self, code: str = "pool_bank_not_ready", *, bank_key: BankKey | None = None):
+        super().__init__([code])
+        self.code = code
+        self.bank_key = bank_key
 
 
 def pda(program: str, *seeds: bytes) -> str:
@@ -253,9 +254,7 @@ class DirectRaydium:
                         }
                         verified.append(address)
                     references = (
-                        [*verified, *group.get(mint, [])]
-                        if refresh
-                        else [*group.get(mint, []), *verified]
+                        [*verified, *group.get(mint, [])] if refresh else [*group.get(mint, []), *verified]
                     )
                     group[mint] = list(dict.fromkeys(references))[: self.settings.direct.max_pools]
                 self.discovery_checked[mint] = time.time()
@@ -535,10 +534,18 @@ class DirectRaydium:
         async def reprice(node, units):
             legs = node.get("_direct_route")
             if not legs:
-                bank = feed.peek((node["pool"], node["inputMint"], node["outputMint"], priority))
+                bank_key = node["pool"], node["inputMint"], node["outputMint"], priority
+                bank = feed.peek(bank_key)
                 if bank is None:
                     raise LocalQuoteNotReady()
-                return await self.quote_bank(node["pool"], node["inputMint"], node["outputMint"], units, bank)
+                try:
+                    return await self.quote_bank(
+                        node["pool"], node["inputMint"], node["outputMint"], units, bank
+                    )
+                except ClmmCalculationError as error:
+                    if error.code == "insufficient_tick_coverage":
+                        raise LocalQuoteNotReady(error.code, bank_key=bank_key) from error
+                    raise
             split = all(
                 (leg["inputMint"], leg["outputMint"]) == (node["inputMint"], node["outputMint"])
                 for leg in legs
@@ -563,6 +570,21 @@ class DirectRaydium:
         feed.promote(result, priority)
         feed.local_quotes += 1
         return result
+
+    def request_minimum_expansion(self, bank_key: BankKey | None) -> bool:
+        """Queue validated bank growth outside the pure local quote lane."""
+        feed = self.bank_feed
+        if feed is None or bank_key is None or not hasattr(feed, "request_minimum_expansion"):
+            return False
+        bank = feed.ready.get(bank_key)
+        if (
+            not bank
+            or bank.get("program") != CLMM
+            or bank.get("array_limit", self.settings.direct.max_tick_arrays)
+            >= self.settings.direct.max_tick_arrays
+        ):
+            return False
+        return feed.request_minimum_expansion(bank_key, self.settings.direct.max_tick_arrays)
 
     @staticmethod
     def bank_versions(plan: dict) -> list[list]:
@@ -726,8 +748,31 @@ class DirectRaydium:
         if type(amount) is not int or not 0 < amount < 2**63 or source == target:
             raise ValueError("Invalid exact-in amount/pair")
         rpc = _rpc if _rpc is not None else self.rpc
+        minimum_arrays = (
+            getattr(_rpc, "minimum_arrays", {}).get((pool, source, target, priority))
+            if isinstance(_rpc, PoolBankFeed) and _max_arrays is None
+            else None
+        )
+        if minimum_arrays is not None and (
+            type(minimum_arrays) is not int or not 1 <= minimum_arrays <= self.settings.direct.max_tick_arrays
+        ):
+            raise ValueError("Invalid minimum tick-array coverage")
+        expansion_arrays = (
+            getattr(_rpc, "minimum_expansion_limits", {}).get((pool, source, target, priority))
+            if isinstance(_rpc, PoolBankFeed) and _max_arrays is None
+            else None
+        )
+        if expansion_arrays is not None:
+            if (
+                type(expansion_arrays) is not int
+                or not 1 <= expansion_arrays <= self.settings.direct.max_tick_arrays
+            ):
+                raise ValueError("Invalid minimum tick-array expansion")
+            minimum_arrays = max(minimum_arrays or 0, expansion_arrays)
         array_limit = _max_arrays or (
-            self.array_hints.get((pool, source), self.settings.direct.max_tick_arrays)
+            minimum_arrays
+            if minimum_arrays is not None
+            else self.array_hints.get((pool, source), self.settings.direct.max_tick_arrays)
             if isinstance(_rpc, PoolBankFeed)
             else self.settings.direct.max_tick_arrays
         )
@@ -740,7 +785,7 @@ class DirectRaydium:
             if isinstance(_rpc, PoolBankFeed) and _reuse_bank
             else None
         )
-        if previous and previous["program"] == CLMM and _max_arrays is None:
+        if previous and previous["program"] == CLMM and _max_arrays is None and minimum_arrays is None:
             # Amount probes share a hint, but an upward hint alone cannot
             # invalidate the addresses of the minimum's ready bank. A larger
             # exact amount still has the explicit full-coverage fallback.
@@ -748,7 +793,11 @@ class DirectRaydium:
         reuse = bool(
             previous
             and previous["program"] == CLMM
-            and (_max_arrays is None or previous["array_limit"] == array_limit)
+            and (
+                _max_arrays is None
+                and array_limit <= previous["array_limit"]
+                or previous["array_limit"] == array_limit
+            )
         )
         if reuse:
             assert previous is not None

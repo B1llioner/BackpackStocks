@@ -89,7 +89,9 @@ async def test_hint_reuse_still_validates_the_new_atomic_bank_and_refuses_invali
         rows[previous["state"]["vaultA"]]["data"]["parsed"]["info"]["owner"] = str(Pubkey.new_unique())
         message = "vault ownership"
     elif tampered == "clock":
-        clock = next(account for account in rows.values() if account and account["owner"].startswith("Sysvar"))
+        clock = next(
+            account for account in rows.values() if account and account["owner"].startswith("Sysvar")
+        )
         clock["data"]["parsed"]["info"]["unixTimestamp"] -= 60
         message = "bank is too old"
     elif tampered == "mint":
@@ -127,6 +129,7 @@ async def test_larger_exact_amount_keeps_the_explicit_full_bank_fallback(banks):
     router, feed, rpc, key, previous, _, q = banks
     previous["array_limit"] = 2
     router.array_hints[key[:2]] = 3
+    feed.minimum_arrays = {key: 2}
     requested = int(q["inAmount"]) * 10
 
     async def quote(pool, source, target, amount, bank):
@@ -143,3 +146,65 @@ async def test_larger_exact_amount_keeps_the_explicit_full_bank_fallback(banks):
     assert rpc.accounts.await_count == 2
     assert [call.args[0]["maxArrays"] for call in router.worker.call.await_args_list] == [8, 8]
     assert set(rpc.accounts.await_args.args[0]) == set(previous["accounts"])
+
+
+async def test_owned_minimum_array_count_overrides_a_larger_probe_hint_and_trims_one_atomic_read(banks):
+    router, feed, rpc, key, previous, _, q = banks
+    extra = [str(Pubkey.new_unique()) for _ in range(6)]
+    previous["arrays"] = [*previous["arrays"], *extra]
+    router.array_hints[key[:2]] = 8
+    feed.minimum_arrays = {key: 2}
+    current = await router._pool_bank(*key[:3], int(q["inAmount"]), priority=10, _rpc=feed)
+    assert current["array_limit"] == 2 and current["arrays"] == q["_direct"]["arrays"]
+    rpc.accounts.assert_awaited_once()
+    assert rpc.accounts.await_args.kwargs["parsed"]
+    assert not set(extra) & set(rpc.accounts.await_args.args[0])
+    router.worker.call.assert_awaited_once()
+    assert router.worker.call.await_args.args[0]["maxArrays"] == 2
+
+
+async def test_growing_owned_minimum_window_fetches_the_full_canonical_required_count(banks):
+    router, feed, rpc, key, previous, _, q = banks
+    previous["array_limit"] = 2
+    router.array_hints[key[:2]] = 2
+    feed.minimum_arrays = {key: 4}
+    current = await router._pool_bank(*key[:3], int(q["inAmount"]), priority=10, _rpc=feed)
+    assert current["array_limit"] == 4 and current["arrays_verified"]
+    assert current["arrays"] == q["_direct"]["arrays"]
+    assert [call.kwargs.get("parsed", False) for call in rpc.accounts.await_args_list] == [False, True]
+    assert [call.args[0]["maxArrays"] for call in router.worker.call.await_args_list] == [4, 4]
+
+
+async def test_pending_minimum_expansion_overrides_the_old_owned_window_and_probe_hint(banks):
+    router, feed, rpc, key, previous, _, q = banks
+    previous["array_limit"] = 2
+    router.array_hints[key[:2]] = 2
+    feed.minimum_arrays = {key: 2}
+    feed.minimum_expansion_limits = {key: 8}
+    current = await router._pool_bank(*key[:3], int(q["inAmount"]), priority=10, _rpc=feed)
+    assert current["array_limit"] == 8 and current["arrays_verified"]
+    assert [call.kwargs.get("parsed", False) for call in rpc.accounts.await_args_list] == [False, True]
+    assert [call.args[0]["maxArrays"] for call in router.worker.call.await_args_list] == [8, 8]
+
+
+async def test_minimum_array_requirements_are_specific_to_the_full_direction_and_priority_key(banks):
+    router, feed, rpc, key, previous, _, q = banks
+    previous["array_limit"] = 2
+    router.array_hints[key[:2]] = 3
+    feed.minimum_arrays = {
+        (key[0], key[2], key[1], key[3]): 4,
+        (*key[:3], 0): 4,
+    }
+    current = await router._pool_bank(*key[:3], int(q["inAmount"]), priority=10, _rpc=feed)
+    assert current["array_limit"] == 2
+    rpc.accounts.assert_awaited_once()
+
+
+@pytest.mark.parametrize("invalid", [0, 9, True, 2.5])
+async def test_invalid_owned_minimum_array_count_cannot_bypass_protocol_bounds(banks, invalid):
+    router, feed, rpc, key, _, _, q = banks
+    feed.minimum_arrays = {key: invalid}
+    with pytest.raises(ValueError, match="minimum tick-array coverage"):
+        await router._pool_bank(*key[:3], int(q["inAmount"]), priority=10, _rpc=feed)
+    rpc.accounts.assert_not_awaited()
+    router.worker.call.assert_not_awaited()
